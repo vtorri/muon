@@ -281,8 +281,9 @@ write_mesondefine:
 			}
 
 			if (i <= id_start) {
-				error_messagef(&src, id_location, log_error, "key of zero length not supported");
-				return false;
+				// This means we got a key of length zero
+				sbuf_pushs(wk, &out_buf, "@@");
+				continue;
 			} else if (!obj_dict_index_strn(wk, dict, &src.src[id_start], i - id_start, &elem)) {
 				error_messagef(&src, id_location, log_error, "key not found in configuration data");
 				return false;
