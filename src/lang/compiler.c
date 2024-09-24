@@ -91,9 +91,23 @@ vm_comp_assert_inline_func_args(struct workspace *wk,
 	}
 }
 
+void
+vm_comp_op_return(struct workspace *wk)
+{
+		if (!wk->vm.in_analyzer) {
+			for (uint32_t i = 0; i < wk->vm.compiler_state.loop_depth; ++i) {
+				push_code(wk, op_swap);
+				push_code(wk, op_pop);
+			}
+		}
+
+		push_code(wk, op_return);
+}
+
 enum vm_compile_block_flags {
 	vm_compile_block_final_return = 1 << 0,
 	vm_compile_block_expr = 1 << 1,
+	vm_compile_block_start_scope = 1 << 2,
 };
 
 static void vm_compile_block(struct workspace *wk, struct node *n, enum vm_compile_block_flags flags);
@@ -205,7 +219,8 @@ vm_comp_node(struct workspace *wk, struct node *n)
 
 				push_code(wk, op_constant);
 				push_constant(wk, 0);
-				push_code(wk, op_return);
+
+				vm_comp_op_return(wk);
 				break;
 			} else if (str_eql(name, &WKSTR("set_variable"))) {
 				push_location(wk, n);
@@ -295,7 +310,8 @@ vm_comp_node(struct workspace *wk, struct node *n)
 			push_code(wk, op_constant);
 			push_constant(wk, 0);
 		}
-		push_code(wk, op_return);
+
+		vm_comp_op_return(wk);
 		break;
 	}
 	case node_type_foreach: {
@@ -362,7 +378,9 @@ vm_comp_node(struct workspace *wk, struct node *n)
 		uint32_t loop_jmp_stack_base = wk->vm.compiler_state.loop_jmp_stack.len;
 		arr_push(&wk->vm.compiler_state.loop_jmp_stack, &loop_body_start);
 
+		++wk->vm.compiler_state.loop_depth;
 		vm_compile_block(wk, n->r, 0);
+		--wk->vm.compiler_state.loop_depth;
 
 		push_code(wk, op_jmp);
 		push_constant(wk, loop_body_start);
@@ -623,7 +641,7 @@ vm_comp_node(struct workspace *wk, struct node *n)
 
 		func->entry = wk->vm.code.len;
 
-		vm_compile_block(wk, n->r, vm_compile_block_final_return);
+		vm_compile_block(wk, n->r, vm_compile_block_final_return | vm_compile_block_start_scope);
 
 		/* function body end */
 
@@ -718,6 +736,10 @@ vm_compile_expr(struct workspace *wk, struct node *n)
 static void
 vm_compile_block(struct workspace *wk, struct node *n, enum vm_compile_block_flags flags)
 {
+	if (flags & vm_compile_block_start_scope) {
+		stack_push(&wk->stack, wk->vm.compiler_state.loop_depth, 0);
+	}
+
 	struct node *prev = 0;
 	while (n && n->l) {
 		assert(n->type == node_type_stmt);
@@ -733,6 +755,10 @@ vm_compile_block(struct workspace *wk, struct node *n, enum vm_compile_block_fla
 
 		prev = n;
 		n = n->r;
+	}
+
+	if (flags & vm_compile_block_start_scope) {
+		stack_pop(&wk->stack, wk->vm.compiler_state.loop_depth);
 	}
 
 	if (flags & vm_compile_block_final_return) {
@@ -778,7 +804,7 @@ vm_compile_ast(struct workspace *wk, struct node *n, enum vm_compile_mode mode, 
 
 	*entry = wk->vm.code.len;
 
-	enum vm_compile_block_flags flags = vm_compile_block_final_return;
+	enum vm_compile_block_flags flags = vm_compile_block_final_return | vm_compile_block_start_scope;
 	if (mode & vm_compile_mode_expr) {
 		flags &= ~vm_compile_block_final_return;
 		flags |= vm_compile_block_expr;
