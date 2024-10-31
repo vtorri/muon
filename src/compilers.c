@@ -998,7 +998,7 @@ TOOLCHAIN_PROTO_1i(compiler_gcc_args_pgo)
 
 TOOLCHAIN_PROTO_0(compiler_gcc_args_pic)
 {
-	TOOLCHAIN_ARGS({ "-fpic" });
+	TOOLCHAIN_ARGS({ "-fPIC" });
 
 	if (host_machine.is_windows) {
 		args.len = 0;
@@ -1010,7 +1010,7 @@ TOOLCHAIN_PROTO_0(compiler_gcc_args_pic)
 
 TOOLCHAIN_PROTO_0(compiler_gcc_args_pie)
 {
-	TOOLCHAIN_ARGS({ "-fpie" });
+	TOOLCHAIN_ARGS({ "-fPIE" });
 	return &args;
 }
 
@@ -1068,6 +1068,13 @@ TOOLCHAIN_PROTO_1s(compiler_gcc_args_color_output)
 TOOLCHAIN_PROTO_0(compiler_gcc_args_lto)
 {
 	TOOLCHAIN_ARGS({ "-flto" });
+
+	return &args;
+}
+
+TOOLCHAIN_PROTO_0(compiler_gcc_args_coverage)
+{
+	TOOLCHAIN_ARGS({ "--coverage" })
 
 	return &args;
 }
@@ -1545,6 +1552,7 @@ build_compilers(void)
 	gcc.args.color_output = compiler_gcc_args_color_output;
 	gcc.args.enable_lto = compiler_gcc_args_lto;
 	gcc.args.deps_type = compiler_deps_gcc;
+	gcc.args.coverage = compiler_gcc_args_coverage;
 	gcc.default_linker = linker_ld;
 	gcc.default_static_linker = static_linker_ar_gcc;
 
@@ -1631,6 +1639,7 @@ build_linkers(void)
 	ld.args.fatal_warnings = linker_ld_args_fatal_warnings;
 	ld.args.whole_archive = linker_ld_args_whole_archive;
 	ld.args.enable_lto = compiler_gcc_args_lto;
+	ld.args.coverage = compiler_gcc_args_coverage;
 
 	struct linker lld = ld;
 

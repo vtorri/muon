@@ -5,9 +5,11 @@ name: macos
 
 on:
   push:
-    branches: [ master ]
+    branches:
+      - master
+      - '[0-9]+.[0-9]+'
   pull_request:
-    branches: [ master ]
+    branches: [master]
     types: [opened, synchronize, reopened]
 
 permissions:
@@ -37,22 +39,20 @@ jobs:
         build/muon -C build test -v -ddots
     - name: build-x86_64
       run: |
-        arch -x86_64 sh -c '
+        arch -x86_64 sh -c "
           ./bootstrap.sh build-x86_64 &&\
-          PATH="build-x86_64:$PATH" build-x86_64/muon -v setup build-x86_64 &&\
+          PATH=\"build-x86_64:$PATH\" build-x86_64/muon -v setup build-x86_64 &&\
           build-x86_64/muon -C build-x86_64 samu\
-        '
+        "
     - name: build-universal-binary
       run: |
-        ver="$(cat build/version.txt)"
+        . "build/version.sh"
         lipo -create -output muon build-x86_64/muon build/muon
-        zip "muon-${ver}-universal-macos.zip" muon
+        zip "muon-$version-universal-macos.zip" muon
     - name: upload-universal-binary
-      if: github.ref == 'refs/heads/master'
       env:
         GH_DEPLOY: 1
       run: |
-        ver="$(cat build/version.txt)"
         echo "${{ secrets.DEPLOY_KEY }}" > ~/.ssh/deploy
         chmod 600 ~/.ssh/deploy
         cat >> ~/.ssh/config <<EOF
@@ -60,5 +60,7 @@ jobs:
             IdentityFile ~/.ssh/deploy
             IdentitiesOnly yes
         EOF
-        tools/ci/deploy.sh "/releases/${ver}" \
-          "muon-${ver}-universal-macos.zip"
+        . "build/version.sh"
+        tools/ci/deploy.sh "/releases/$version" \
+          "muon-$version-universal-macos.zip"
+      if: github.event_name != 'pull_request'

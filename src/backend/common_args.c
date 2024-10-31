@@ -266,6 +266,11 @@ setup_optional_b_args_compiler(struct workspace *wk,
 	if (get_obj_bool(wk, opt)) {
 		push_args(wk, args, toolchain_compiler_enable_lto(wk, comp));
 	}
+
+	get_option_value_for_tgt(wk, proj, tgt, "b_coverage", &opt);
+	if (get_obj_bool(wk, opt)) {
+		push_args(wk, args, toolchain_compiler_coverage(wk, comp));
+	}
 }
 
 static bool
@@ -553,6 +558,12 @@ setup_optional_b_args_linker(struct workspace *wk,
 	if (get_obj_bool(wk, opt)) {
 		push_args(wk, args, toolchain_linker_enable_lto(wk, comp));
 	}
+
+	get_option_value_for_tgt(wk, proj, tgt, "b_coverage", &opt);
+	if (get_obj_bool(wk, opt)) {
+		push_args(wk, args, toolchain_linker_coverage(wk, comp));
+	}
+
 	return true;
 }
 
@@ -625,6 +636,10 @@ setup_linker_args(struct workspace *wk,
 		obj proj_args;
 		if (obj_dict_geti(wk, proj->link_args, ctx->compiler->lang, &proj_args)) {
 			obj_array_extend(wk, ctx->args->link_args, proj_args);
+		}
+
+		if (tgt && tgt->flags & build_tgt_flag_pic) {
+			push_args(wk, ctx->args->link_args, toolchain_compiler_pic(wk, ctx->compiler));
 		}
 	}
 
