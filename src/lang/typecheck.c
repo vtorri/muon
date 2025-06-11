@@ -485,6 +485,8 @@ type_tags_eql(struct workspace *wk, type_tag a, type_tag b)
 type_tag
 flatten_type(struct workspace *wk, type_tag t)
 {
+	t &= ~TYPE_TAG_ALLOW_NULL;
+
 	if (!(t & TYPE_TAG_COMPLEX)) {
 		t &= ~TYPE_TAG_GLOB;
 
@@ -530,6 +532,10 @@ complex_type_enum_get(struct workspace *wk, enum complex_type_preset t)
 			break;
 		case tc_cx_enum_machine_system: FOREACH_MACHINE_SYSTEM(STR_ENUM) break;
 		case tc_cx_enum_machine_subsystem: FOREACH_MACHINE_SUBSYSTEM(STR_ENUM) break;
+		case tc_cx_enum_shell:
+			str_enum_add_type_value(wk, e, "posix");
+			str_enum_add_type_value(wk, e, "cmd");
+			break;
 		default: UNREACHABLE_RETURN;
 		}
 	}
@@ -568,11 +574,20 @@ complex_type_preset_get(struct workspace *wk, enum complex_type_preset t)
 				make_complex_type(wk, complex_type_nested, tc_dict, tc_string),
 				make_complex_type(wk, complex_type_nested, tc_array, tc_string)));
 		break;
+	case tc_cx_enum_shell:
 	case tc_cx_enum_machine_system:
 	case tc_cx_enum_machine_subsystem:
 	case tc_cx_enum_machine_endian: {
 		obj values = obj_dict_index_as_obj(wk, complex_type_enum_get(wk, t), "");
 		return COMPLEX_TYPE(values, complex_type_enum);
+	}
+	case tc_cx_list_of_number: {
+		tag = make_complex_type(wk, complex_type_nested, tc_array, tc_number);
+		break;
+	}
+	case tc_cx_dict_of_str: {
+		tag = make_complex_type(wk, complex_type_nested, tc_dict, tc_string);
+		break;
 	}
 	default: UNREACHABLE;
 	}

@@ -1982,7 +1982,7 @@ obj_to_s_opts(struct workspace *wk, obj o, struct tstr *sb, struct obj_to_s_opts
 		case dependency_type_pkgconf: type = "pkgconf"; break;
 		case dependency_type_threads: type = "threads"; break;
 		case dependency_type_external_library: type = "external_library"; break;
-		case dependency_type_appleframeworks: type = "appleframeworks"; break;
+		case dependency_type_system: type = "system"; break;
 		case dependency_type_not_found: type = "not_found"; break;
 		}
 
@@ -2519,7 +2519,7 @@ obj_inspect(struct workspace *wk, obj val)
  * object to json
  */
 
-void
+bool
 obj_to_json(struct workspace *wk, obj o, struct tstr *sb)
 {
 	switch (get_obj_type(wk, o)) {
@@ -2528,7 +2528,10 @@ obj_to_json(struct workspace *wk, obj o, struct tstr *sb)
 		obj v;
 		obj_array_for_(wk, o, v, iter)
 		{
-			obj_to_json(wk, v, sb);
+			if (!obj_to_json(wk, v, sb)) {
+				return false;
+			}
+
 			if (iter.i < iter.len - 1) {
 				tstr_pushs(wk, sb, ", ");
 			}
@@ -2541,9 +2544,13 @@ obj_to_json(struct workspace *wk, obj o, struct tstr *sb)
 		uint32_t i = 0, len = get_obj_dict(wk, o)->len;
 		obj k, v;
 		obj_dict_for(wk, o, k, v) {
-			obj_to_json(wk, k, sb);
+			if (!obj_to_json(wk, k, sb)) {
+				return false;
+			}
 			tstr_pushs(wk, sb, ": ");
-			obj_to_json(wk, v, sb);
+			if (!obj_to_json(wk, v, sb)) {
+				return false;
+			}
 
 			if (i < len - 1) {
 				tstr_pushs(wk, sb, ", ");
@@ -2577,6 +2584,9 @@ obj_to_json(struct workspace *wk, obj o, struct tstr *sb)
 		tstr_pushs(wk, sb, "null");
 		break;
 	}
-	default: error_unrecoverable("unable to convert %s to json", obj_type_to_s(get_obj_type(wk, o))); break;
+	default: vm_error(wk, "unable to convert %s to json", obj_type_to_s(get_obj_type(wk, o)));
+			 return false;
 	}
+
+	return true;
 }

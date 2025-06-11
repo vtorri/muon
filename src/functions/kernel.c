@@ -36,6 +36,7 @@
 #include "platform/filesystem.h"
 #include "platform/path.h"
 #include "platform/run_cmd.h"
+#include "version.h"
 #include "wrap.h"
 
 static bool
@@ -208,6 +209,19 @@ func_project(struct workspace *wk, obj _, obj *res)
 			an[0].node,
 			"This muon has not been fully bootstrapped. It can only be used to setup muon itself.");
 		return false;
+	}
+#endif
+
+#ifdef MUON_BOOTSTRAPPED
+	if (akw[kw_meson_version].set) {
+		if (!version_compare(&STRL(muon_version.meson_compat), get_str(wk, akw[kw_meson_version].val))) {
+			vm_error_at(wk,
+				akw[kw_meson_version].node,
+				"meson compatibility version %s does not meet requirement: %o",
+				muon_version.meson_compat,
+				akw[kw_meson_version].val);
+			return false;
+		}
 	}
 #endif
 
@@ -571,7 +585,7 @@ find_program_custom_dir_iter(struct workspace *wk, void *_ctx, obj val)
 	return ir_cont;
 }
 
-static bool
+bool
 find_program_check_override(struct workspace *wk, struct find_program_ctx *ctx, obj prog)
 {
 	obj override;
@@ -579,11 +593,11 @@ find_program_check_override(struct workspace *wk, struct find_program_ctx *ctx, 
 		return true;
 	}
 
-	obj over = 0, op;
+	obj override_version = 0, op;
 	switch (get_obj_type(wk, override)) {
 	case obj_array:
 		op = obj_array_index(wk, override, 0);
-		over = obj_array_index(wk, override, 1);
+		override_version = obj_array_index(wk, override, 1);
 		break;
 	case obj_python_installation:
 	case obj_external_program:
@@ -595,17 +609,14 @@ find_program_check_override(struct workspace *wk, struct find_program_ctx *ctx, 
 		}
 
 		if (ctx->version) {
-			find_program_guess_version(wk, ep->cmd_array, ctx->version_argument, &over);
+			find_program_guess_version(wk, ep->cmd_array, ctx->version_argument, &override_version);
 		}
 		break;
 	default: UNREACHABLE;
 	}
 
-	if (ctx->version && over) {
-		bool comparison_result;
-		if (!version_compare(wk, ctx->version_node, get_str(wk, over), ctx->version, &comparison_result)) {
-			return false;
-		} else if (!comparison_result) {
+	if (ctx->version && override_version) {
+		if (!version_compare_list(wk, get_str(wk, override_version), ctx->version)) {
 			return true;
 		}
 	}
@@ -633,8 +644,8 @@ find_program_check_fallback(struct workspace *wk, struct find_program_ctx *ctx, 
 		obj_array_flatten_one(wk, fallback_arr, &subproj_name);
 
 		obj subproj;
-		if (!subproject(wk, subproj_name, requirement_auto, ctx->default_options, NULL, &subproj)
-			&& get_obj_subproject(wk, subproj)->found) {
+		if (!(subproject(wk, subproj_name, requirement_auto, ctx->default_options, NULL, &subproj)
+			&& get_obj_subproject(wk, subproj)->found)) {
 			return true;
 		}
 
@@ -645,11 +656,31 @@ find_program_check_fallback(struct workspace *wk, struct find_program_ctx *ctx, 
 			if (!obj_dict_index(wk, wk->find_program_overrides[ctx->machine], prog, &_)) {
 				vm_warning_at(wk,
 					0,
-					"subproject %o claims to provide %o, but did not override it",
+					"subproject %o claims to provide %o for the %s machine, but did not override it",
 					subproj_name,
-					prog);
+					prog,
+					machine_kind_to_s(ctx->machine));
 			}
 		}
+	}
+
+	return true;
+}
+
+bool
+find_program_check_version(struct workspace *wk, struct find_program_ctx *ctx, obj ver)
+{
+	if (!ctx->version) {
+		return true;
+	}
+
+	if (!ver) {
+		return true; // no version to check against
+	}
+
+	if (!version_compare_list(wk, get_str(wk, ver), ctx->version)) {
+		LO("version %o does not meet requirement: %o\n", ver, ctx->version);
+		return false;
 	}
 
 	return true;
@@ -696,11 +727,6 @@ find_program(struct workspace *wk, struct find_program_ctx *ctx, obj prog)
 		const bool is_meson = strcmp(str, "meson") == 0;
 		const bool is_muon = !is_meson && strcmp(str, "muon") == 0;
 		if (is_meson || is_muon) {
-			*ctx->res = make_obj(wk, obj_external_program);
-			struct obj_external_program *ep = get_obj_external_program(wk, *ctx->res);
-			ep->found = true;
-			ep->cmd_array = make_obj(wk, obj_array);
-
 			const char *argv0_resolved;
 			TSTR(argv0);
 			if (fs_find_cmd(wk, &argv0, wk->argv0)) {
@@ -708,12 +734,27 @@ find_program(struct workspace *wk, struct find_program_ctx *ctx, obj prog)
 			} else {
 				argv0_resolved = wk->argv0;
 			}
-			obj_array_push(wk, ep->cmd_array, make_str(wk, argv0_resolved));
+
+			obj ver = 0, cmd_array = make_obj(wk, obj_array);
+			obj_array_push(wk, cmd_array, make_str(wk, argv0_resolved));
 
 			if (is_meson) {
-				obj_array_push(wk, ep->cmd_array, make_str(wk, "meson"));
+				obj_array_push(wk, cmd_array, make_str(wk, "meson"));
+				ver = make_str(wk, muon_version.meson_compat);
+			} else {
+				ver = make_str(wk, muon_version.version);
 			}
 
+			if (!find_program_check_version(wk, ctx, ver)) {
+				return true;
+			}
+
+			*ctx->res = make_obj(wk, obj_external_program);
+			struct obj_external_program *ep = get_obj_external_program(wk, *ctx->res);
+			ep->found = true;
+			ep->cmd_array = cmd_array;
+			ep->ver = ver;
+			ep->guessed_ver = true;
 			ctx->found = true;
 			return true;
 		}
@@ -813,14 +854,7 @@ found: {
 		find_program_guess_version(wk, cmd_array, ctx->version_argument, &ver);
 		guessed_ver = true;
 
-		if (!ver) {
-			return true; // no version to check against
-		}
-
-		bool comparison_result;
-		if (!version_compare(wk, ctx->version_node, get_str(wk, ver), ctx->version, &comparison_result)) {
-			return false;
-		} else if (!comparison_result) {
+		if (!find_program_check_version(wk, ctx, ver)) {
 			return true;
 		}
 	}
@@ -1000,6 +1034,8 @@ func_assert(struct workspace *wk, obj _, obj *res)
 	if (!get_obj_bool(wk, an[0].val)) {
 		if (an[1].set) {
 			LOG_E("%s", get_cstr(wk, an[1].val));
+		} else {
+			vm_error(wk, "assertion failed");
 		}
 		return false;
 	}
@@ -1961,7 +1997,6 @@ push_alias_target_deps_iter(struct workspace *wk, void *_ctx, obj val)
 		push_alias_target_deps_iter(wk, ctx, get_obj_both_libs(wk, val)->static_lib);
 		break;
 	}
-	/* fallthrough */
 	case obj_alias_target:
 	case obj_build_target:
 	case obj_custom_target: obj_array_push(wk, ctx->deps, val); break;
@@ -2273,6 +2308,7 @@ const struct func_impl impl_tbl_kernel[] =
 
 const struct func_impl impl_tbl_kernel_internal[] = {
 	{ "assert", func_assert, .flags = func_impl_flag_throws_error },
+	{ "configure_file", func_configure_file, tc_file },
 	{ "configuration_data", func_configuration_data, tc_configuration_data },
 	{ "disabler", func_disabler, tc_disabler },
 	{ "environment", func_environment, tc_environment },

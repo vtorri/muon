@@ -131,6 +131,8 @@ introspect_build_target(struct workspace *wk, struct project *proj, obj tgt)
 			}
 			obj_dict_set(wk, lang_src, make_str(wk, "sources"), file_list);
 
+			obj_dict_set(wk, lang_src, make_str(wk, "machine"), make_str(wk, machine_kind_to_s(t->machine)));
+
 			obj_array_push(wk, src, lang_src);
 		}
 
@@ -327,8 +329,8 @@ introspect_write(struct workspace *wk, void *_ctx, FILE *f)
 	if (!o) {
 		return false;
 	}
-	obj_to_json(wk, o, &buf);
-	return true;
+
+	return obj_to_json(wk, o, &buf);
 }
 
 static bool

@@ -43,6 +43,7 @@ make_project(struct workspace *wk, uint32_t *id, const char *subproject_name, co
 		proj->include_dirs[i] = make_obj(wk, obj_dict);
 		proj->dep_cache.static_deps[i] = make_obj(wk, obj_dict);
 		proj->dep_cache.shared_deps[i] = make_obj(wk, obj_dict);
+		proj->dep_cache.frameworks[i] = make_obj(wk, obj_dict);
 	}
 
 	proj->subprojects_dir = make_str(wk, "subprojects");
@@ -133,7 +134,6 @@ workspace_init_runtime(struct workspace *wk)
 	wk->global_opts = make_obj(wk, obj_dict);
 	wk->compiler_check_cache = make_obj(wk, obj_dict);
 	wk->dependency_handlers = make_obj(wk, obj_dict);
-	wk->finalizers = make_obj(wk, obj_array);
 
 	for (uint32_t i = 0; i < machine_kind_count; ++i) {
 		wk->toolchains[i] = make_obj(wk, obj_dict);
@@ -142,6 +142,7 @@ workspace_init_runtime(struct workspace *wk)
 		wk->dep_overrides_static[i] = make_obj(wk, obj_dict);
 		wk->dep_overrides_dynamic[i] = make_obj(wk, obj_dict);
 		wk->find_program_overrides[i] = make_obj(wk, obj_dict);
+		wk->machine_properties[i] = make_obj(wk, obj_dict);
 	}
 }
 
@@ -188,7 +189,7 @@ workspace_destroy(struct workspace *wk)
 	TracyCZoneAutoE;
 }
 
-bool
+void
 workspace_setup_paths(struct workspace *wk, const char *build, const char *argv0, uint32_t argc, char *const argv[])
 {
 	TSTR(build_root);
@@ -208,7 +209,11 @@ workspace_setup_paths(struct workspace *wk, const char *build, const char *argv0
 	TSTR(muon_private);
 	path_join(wk, &muon_private, wk->build_root, output_path.private_dir);
 	wk->muon_private = get_cstr(wk, tstr_into_str(wk, &muon_private));
+}
 
+static bool
+workspace_create_build_dir(struct workspace *wk)
+{
 	if (!fs_mkdir_p(wk->muon_private)) {
 		return false;
 	}
@@ -383,6 +388,10 @@ workspace_add_exclude_regenerate_dep(struct workspace *wk, obj v)
 void
 workspace_add_regenerate_dep(struct workspace *wk, obj v)
 {
+	if (!wk->regenerate_deps) {
+		return;
+	}
+
 	v = make_str_path_absolute(wk, v);
 	const char *s = get_cstr(wk, v);
 
@@ -420,6 +429,17 @@ workspace_cwd(struct workspace *wk)
 	}
 }
 
+const char *
+workspace_build_dir(struct workspace *wk)
+{
+	if (wk->vm.lang_mode == language_internal) {
+		return wk->build_root;
+	} else {
+		return get_cstr(wk, current_project(wk)->build_dir);
+	}
+}
+
+
 bool
 workspace_do_setup(struct workspace *wk, const char *build, const char *argv0, uint32_t argc, char *const argv[])
 {
@@ -429,7 +449,9 @@ workspace_do_setup(struct workspace *wk, const char *build, const char *argv0, u
 	bool progress = log_is_progress_bar_enabled();
 	log_progress_disable();
 
-	if (!workspace_setup_paths(wk, build, argv0, argc, argv)) {
+	workspace_setup_paths(wk, build, argv0, argc, argv);
+
+	if (!workspace_create_build_dir(wk)) {
 		goto ret;
 	}
 
@@ -474,17 +496,8 @@ workspace_do_setup(struct workspace *wk, const char *build, const char *argv0, u
 
 	if (log_is_progress_bar_enabled()) {
 		log_progress_disable();
-		log_raw("\033[0K");
 	} else {
 		log_plain(log_info, "\n");
-	}
-
-	obj finalizer;
-	obj_array_for(wk, wk->finalizers, finalizer) {
-		obj _;
-		if (!vm_eval_capture(wk, finalizer, 0, 0, &_)) {
-			goto ret;
-		}
 	}
 
 	if (!backend_output(wk)) {

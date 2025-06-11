@@ -8,6 +8,8 @@
 
 #include <string.h>
 
+#include "args.h"
+#include "backend/common_args.h"
 #include "buf_size.h"
 #include "coerce.h"
 #include "external/pkgconfig.h"
@@ -192,18 +194,17 @@ check_dependency_cache(struct workspace *wk, struct dep_lookup_ctx *ctx, obj *re
 }
 
 static bool
-check_dependency_version(struct workspace *wk, obj dep_ver_str, uint32_t err_node, obj ver, bool *res)
+check_dependency_version(struct workspace *wk, obj dep_ver_str, obj ver)
 {
 	if (!ver) {
-		*res = true;
 		return true;
 	}
 
-	if (!version_compare(wk, err_node, get_str(wk, dep_ver_str), ver, res)) {
+	if (!dep_ver_str) {
 		return false;
 	}
 
-	return true;
+	return version_compare_list(wk, get_str(wk, dep_ver_str), ver);
 }
 
 static bool
@@ -299,10 +300,10 @@ not_found:
 static bool
 get_dependency_pkgconfig(struct workspace *wk, struct dep_lookup_ctx *ctx, bool *found)
 {
-	struct pkgconf_info info = { 0 };
+	struct pkgconfig_info info = { 0 };
 	*found = false;
 
-	if (!muon_pkgconf_lookup(wk,
+	if (!muon_pkgconfig_lookup(wk,
 		    get_dependency_c_compiler(wk, ctx->machine),
 		    ctx->name,
 		    ctx->lib_mode == dep_lib_mode_static,
@@ -311,18 +312,6 @@ get_dependency_pkgconfig(struct workspace *wk, struct dep_lookup_ctx *ctx, bool 
 	}
 
 	obj ver_str = make_str(wk, info.version);
-	bool ver_match;
-	if (!check_dependency_version(wk, ver_str, ctx->err_node, ctx->versions->val, &ver_match)) {
-		return false;
-	} else if (!ver_match) {
-		obj_lprintf(wk,
-			log_note,
-			"pkgconf found dependency %o, but the version %o does not match the requested version %o\n",
-			ctx->name,
-			ver_str,
-			ctx->versions->val);
-		return true;
-	}
 
 	*ctx->res = make_obj(wk, obj_dependency);
 	struct obj_dependency *dep = get_obj_dependency(wk, *ctx->res);
@@ -347,14 +336,112 @@ get_dependency_pkgconfig(struct workspace *wk, struct dep_lookup_ctx *ctx, bool 
 	return true;
 }
 
-static bool
-get_dependency_appleframeworks(struct workspace *wk, struct dep_lookup_ctx *ctx, bool *found)
+struct get_dependency_extraframework_scan_path_ctx {
+	struct workspace *wk;
+	const struct str *fw;
+	obj res;
+};
+
+static enum iteration_result
+get_dependency_extraframework_scan_path_cb(void *_ctx, const char *path)
 {
-	if (host_machine.sys != machine_system_darwin) {
+	struct get_dependency_extraframework_scan_path_ctx *ctx = _ctx;
+
+	struct str p = STRL(path);
+	const struct str suffix = STR(".framework");
+
+	if (str_endswith(&p, &suffix)) {
+		p.len -= suffix.len;
+		if (str_eqli(&p, ctx->fw)) {
+			ctx->res = make_strn(ctx->wk, p.s, p.len);
+			return ir_done;
+		}
+	}
+
+	return ir_cont;
+}
+
+static bool
+get_dependency_extraframework(struct workspace *wk, struct dep_lookup_ctx *ctx, bool *found)
+{
+	if (machine_definitions[ctx->machine]->sys != machine_system_darwin) {
+		L("skipping extraframework dependency lookup: %s machine system is not darwin",
+			machine_kind_to_s(ctx->machine));
 		return true;
 	}
 
+	obj compiler = get_dependency_c_compiler(wk, ctx->machine);
+	if (!compiler) {
+		L("skipping extraframework dependency lookup: no compiler defined");
+		return true;
+	}
+
+	struct obj_compiler *comp = get_obj_compiler(wk, compiler);
+	if (comp->type[toolchain_component_compiler] != compiler_apple_clang) {
+		L("skipping extraframework dependency lookup: compiler type is not apple clang");
+		return true;
+	}
+
+	if (!comp->fwdirs) {
+		obj cmd;
+		obj_array_dup(wk, comp->cmd_arr[toolchain_component_compiler], &cmd);
+		obj_array_push(wk, cmd, make_str(wk, "-v"));
+		obj_array_push(wk, cmd, make_str(wk, "-E"));
+		obj_array_push(wk, cmd, make_str(wk, "-"));
+		push_args(wk, cmd, toolchain_compiler_always(wk, comp));
+		ca_get_option_compile_args(wk, comp, current_project(wk), 0, cmd);
+
+		const char *argstr;
+		uint32_t argc;
+		join_args_argstr(wk, &argstr, &argc, cmd);
+
+		struct compiler_check_cache_key key = { comp, argstr, "", argc };
+		obj k = compiler_check_cache_key(wk, &key);
+
+		struct compiler_check_cache_value val = { 0 };
+		if (compiler_check_cache_get(wk, k, &val)) {
+			comp->fwdirs = val.value;
+		} else {
+			comp->fwdirs = make_obj(wk, obj_array);
+			struct run_cmd_ctx cmd_ctx = { 0 };
+			if (run_cmd(&cmd_ctx, argstr, argc, 0, 0) && cmd_ctx.status == 0) {
+				char *e, *s = cmd_ctx.err.buf, *eof = s + cmd_ctx.err.len;
+				const struct str fw_suffix = STR("(framework directory)");
+				while (s < eof) {
+					if (!(e = strchr(s, '\n'))) {
+						e = eof;
+					}
+
+					struct str line = { s, e - s };
+					if (str_contains(&line, &fw_suffix)) {
+						line.s += 1;
+						line.len -= 2 + fw_suffix.len;
+						obj_array_push(wk, comp->fwdirs, make_strn(wk, line.s, line.len));
+					}
+
+					s = e + 1;
+				}
+			} else {
+				run_cmd_print_error(&cmd_ctx, log_debug);
+
+				L("failed to determine compiler framework directories");
+
+				// Add a dummy framework directory so we can still utilize it
+				// when building the cache key.
+				obj_array_push(wk, comp->fwdirs, make_str(wk, "unknown://"));
+			}
+			run_cmd_ctx_destroy(&cmd_ctx);
+
+			val.success = true;
+			val.value = comp->fwdirs;
+			compiler_check_cache_set(wk, k, &val);
+		}
+
+		LO("detected compiler framework directories: %o\n", comp->fwdirs);
+	}
+
 	obj modules;
+	bool handle_as_appleframeworks = false;
 
 	if (strcmp(get_cstr(wk, ctx->name), "appleframeworks") == 0) {
 		if (!ctx->modules) {
@@ -362,64 +449,149 @@ get_dependency_appleframeworks(struct workspace *wk, struct dep_lookup_ctx *ctx,
 			return false;
 		}
 
+		handle_as_appleframeworks = true;
 		modules = ctx->modules;
 	} else {
 		modules = make_obj(wk, obj_array);
 		obj_array_push(wk, modules, ctx->name);
 	}
 
-	obj compiler = get_dependency_c_compiler(wk, ctx->machine);
-	if (!compiler) {
-		return true;
-	}
+	obj found_frameworks = make_obj(wk, obj_array);
 
-	bool all_found = true;
-
-	obj fw;
+	obj fw, fw_dir;
 	obj_array_for(wk, modules, fw) {
-		struct compiler_check_opts opts = {
-			.mode = compiler_check_mode_link,
-			.comp_id = compiler,
-		};
+		obj dep = 0;
 
-		opts.args = make_obj(wk, obj_array);
-		obj_array_push(wk, opts.args, make_str(wk, "-framework"));
-		obj_array_push(wk, opts.args, fw);
+		obj_array_for(wk, comp->fwdirs, fw_dir) {
+			const char *fw_dir_str = get_str(wk, fw_dir)->s;
+			if (fs_dir_exists(fw_dir_str)) {
+				struct get_dependency_extraframework_scan_path_ctx scan_path_ctx = {
+					.wk = wk,
+					.fw = get_str(wk, fw),
+				};
+				fs_dir_foreach(get_str(wk, fw_dir)->s,
+					&scan_path_ctx,
+					get_dependency_extraframework_scan_path_cb);
+				if (!scan_path_ctx.res) {
+					continue;
+				}
 
-		bool ok;
-		const char *src = "int main(void) { return 0; }\n";
-		if (!compiler_check(wk, &opts, src, 0, &ok)) {
-			return false;
+				fw = scan_path_ctx.res;
+			}
+
+			obj fw_path;
+			TSTR(fw_path_buf);
+			{
+				path_join(wk, &fw_path_buf, get_str(wk, fw_dir)->s, get_str(wk, fw)->s);
+				tstr_pushs(wk, &fw_path_buf, ".framework");
+				fw_path = tstr_into_str(wk, &fw_path_buf);
+			}
+
+			if (obj_dict_index(
+				    wk, current_project(wk)->dep_cache.frameworks[ctx->machine], fw_path, &dep)) {
+				break;
+			}
+
+			struct compiler_check_opts opts = {
+				.mode = compiler_check_mode_link,
+				.comp_id = compiler,
+			};
+
+			obj compile_args = make_obj(wk, obj_array);
+			// TODO: add -F when adding support for the "paths" kwarg.  We
+			// don't need to add -F ever right now since the fw must come from
+			// a system path.
+			// obj_array_push(wk, compile_args, make_str(wk, "-F"));
+			// obj_array_push(wk, compile_args, fw_dir);
+
+			obj link_args = make_obj(wk, obj_array);
+			obj_array_push(wk, link_args, make_str(wk, "-framework"));
+			obj_array_push(wk, link_args, fw);
+
+			opts.args = make_obj(wk, obj_array);
+			obj_array_extend(wk, opts.args, compile_args);
+			obj_array_extend(wk, opts.args, link_args);
+
+			bool ok;
+			const char *src = "int main(void) { return 0; }\n";
+			if (!compiler_check(wk, &opts, src, 0, &ok)) {
+				return false;
+			}
+
+			if (!ok) {
+				continue;
+			}
+
+			obj include_directories = 0;
+			if (!handle_as_appleframeworks) {
+				const char *header_paths[] = {
+					"Headers",
+					"Versions/Current/Headers",
+				};
+				for (uint32_t i = 0; i < ARRAY_LEN(header_paths); ++i) {
+					TSTR(dir);
+					path_join(wk, &dir, fw_path_buf.buf, header_paths[i]);
+					if (fs_dir_exists(dir.buf)) {
+						include_directories = make_obj(wk, obj_array);
+						obj inc = make_obj(wk, obj_include_directory);
+						struct obj_include_directory *i = get_obj_include_directory(wk, inc);
+						i->path = tstr_into_str(wk, &dir);
+						i->is_idirafter = true;
+						obj_array_push(wk, include_directories, inc);
+						break;
+					}
+				}
+			}
+
+			dep = make_obj(wk, obj_dependency);
+			struct obj_dependency *d = get_obj_dependency(wk, dep);
+			d->name = fw_path;
+			d->flags |= dep_flag_found;
+			d->type = dependency_type_pkgconf;
+			d->machine = ctx->machine;
+			struct build_dep_raw raw = {
+				.include_directories = include_directories,
+				.compile_args = compile_args,
+				.link_args = link_args,
+			};
+
+			if (!dependency_create(wk, &raw, &d->dep, 0)) {
+				return false;
+			}
+
+			obj_dict_set(wk, current_project(wk)->dep_cache.frameworks[ctx->machine], fw_path, dep);
+			break;
 		}
 
-		if (!ok) {
-			all_found = false;
+		if (!dep) {
+			// Missing one module means the entire dependency is not found
+			return true;
 		}
+
+		obj_array_push(wk, found_frameworks, dep);
 	}
 
-	*found = all_found;
+	*found = true;
 
-	if (!*found) {
+	if (obj_array_flatten_one(wk, found_frameworks, ctx->res)) {
 		return true;
 	}
 
 	*ctx->res = make_obj(wk, obj_dependency);
-
 	struct obj_dependency *dep = get_obj_dependency(wk, *ctx->res);
 
 	char name[512];
-	obj_snprintf(wk, name, sizeof(name), "framework:%o", modules);
+	obj_snprintf(wk, name, sizeof(name), "frameworks:%o", modules);
 
 	dep->name = make_str(wk, name);
 	dep->flags |= dep_flag_found;
-	dep->type = dependency_type_appleframeworks;
-	dep->dep.frameworks = make_obj(wk, obj_array);
+	dep->type = dependency_type_declared;
 
-	obj v;
-	obj_array_for(wk, modules, v) {
-		obj_array_push(wk, dep->dep.frameworks, v);
-	}
-	return true;
+	struct build_dep_raw raw = {
+		.deps = found_frameworks,
+	};
+
+	return dependency_create(wk, &raw, &dep->dep, 0);
 }
 
 static bool
@@ -454,7 +626,7 @@ static const native_dependency_lookup_handler dependency_lookup_handlers[] = {
 	[dependency_lookup_method_pkgconfig] = get_dependency_pkgconfig,
 	[dependency_lookup_method_builtin] = 0,
 	[dependency_lookup_method_system] = get_dependency_system,
-	[dependency_lookup_method_extraframework] = get_dependency_appleframeworks,
+	[dependency_lookup_method_extraframework] = get_dependency_extraframework,
 };
 
 struct dependency_lookup_handler {
@@ -462,6 +634,7 @@ struct dependency_lookup_handler {
 		dependency_lookup_handler_type_native,
 		dependency_lookup_handler_type_capture,
 	} type;
+	enum dependency_lookup_method m;
 	union {
 		native_dependency_lookup_handler native;
 		obj capture;
@@ -478,6 +651,7 @@ dependency_lookup_handler_push_native(struct dependency_lookup_handlers *handler
 {
 	assert(handlers->len < ARRAY_LEN(handlers->e));
 	handlers->e[handlers->len].type = dependency_lookup_handler_type_native;
+	handlers->e[handlers->len].m = m;
 	handlers->e[handlers->len].handler.native = dependency_lookup_handlers[m];
 	++handlers->len;
 }
@@ -492,6 +666,7 @@ dependency_lookup_handler_push_capture(struct dependency_lookup_handlers *handle
 	} else {
 		assert(handlers->len < ARRAY_LEN(handlers->e));
 		handlers->e[handlers->len].type = dependency_lookup_handler_type_capture;
+		handlers->e[handlers->len].m = m;
 		handlers->e[handlers->len].handler.capture = o;
 		++handlers->len;
 	}
@@ -586,14 +761,8 @@ get_dependency(struct workspace *wk, struct dep_lookup_ctx *ctx)
 				LO("found %o in cache\n", ctx->name);
 			}
 
-			bool ver_match;
 			struct obj_dependency *dep = get_obj_dependency(wk, cached_dep);
-			if (!check_dependency_version(
-				    wk, dep->version, ctx->versions->node, ctx->versions->val, &ver_match)) {
-				return false;
-			}
-
-			if (!ver_match) {
+			if (!check_dependency_version(wk, dep->version, ctx->versions->val)) {
 				return true;
 			}
 
@@ -637,6 +806,25 @@ get_dependency(struct workspace *wk, struct dep_lookup_ctx *ctx)
 			if (ok) {
 				struct obj_dependency *dep = get_obj_dependency(wk, *ctx->res);
 				dep->name = ctx->name;
+
+				switch (handlers.e[i].m) {
+				case dependency_lookup_method_pkgconfig: {
+					dep->public_type = dependency_public_type_pkgconfig;
+					break;
+				}
+				case dependency_lookup_method_builtin: {
+				case dependency_lookup_method_system:
+				case dependency_lookup_method_extraframework:
+					dep->public_type = dependency_public_type_system;
+					break;
+				}
+				case dependency_lookup_method_auto: break;
+				case dependency_lookup_method_sysconfig: break;
+				case dependency_lookup_method_config_tool: break;
+				case dependency_lookup_method_dub: break;
+				case dependency_lookup_method_cmake: break;
+				}
+
 				if (dep->flags & dep_flag_found) {
 					ctx->found = true;
 				}
@@ -650,6 +838,19 @@ get_dependency(struct workspace *wk, struct dep_lookup_ctx *ctx)
 		}
 
 		if (ctx->found) {
+			struct obj_dependency *dep = get_obj_dependency(wk, *ctx->res);
+			if (!check_dependency_version(wk, dep->version, ctx->versions->val)) {
+				obj_lprintf(wk,
+					log_note,
+					"found dependency %o, but the version %s does not match the requested version %o\n",
+					ctx->name,
+					dep->version ? get_str(wk, dep->version)->s : "'unknown'",
+					ctx->versions->val);
+				ctx->found = false;
+				*ctx->res = 0;
+				continue;
+			}
+
 			break;
 		}
 	}
@@ -692,7 +893,7 @@ handle_special_dependency(struct workspace *wk, struct dep_lookup_ctx *ctx)
 			return handle_special_dependency_result_error;
 		}
 	} else if (strcmp(get_cstr(wk, ctx->name), "appleframeworks") == 0) {
-		get_dependency_appleframeworks(wk, ctx, &ctx->found);
+		get_dependency_extraframework(wk, ctx, &ctx->found);
 	} else if (strcmp(get_cstr(wk, ctx->name), "") == 0) {
 		if (ctx->requirement == requirement_required) {
 			vm_error_at(wk, ctx->err_node, "dependency '' cannot be required");
@@ -897,7 +1098,10 @@ func_dependency(struct workspace *wk, obj self, obj *res)
 
 		switch (handle_special_dependency(wk, &sub_ctx)) {
 		case handle_special_dependency_result_error: return false;
-		case handle_special_dependency_result_stop: break;
+		case handle_special_dependency_result_stop: {
+			fallback_allowed = false;
+			break;
+		}
 		case handle_special_dependency_result_continue:
 			if (!sub_ctx.found) {
 				TracyCZoneN(tctx_1, "get_dependency", true);
@@ -1034,10 +1238,12 @@ func_dependency(struct workspace *wk, obj self, obj *res)
 		}
 	} else {
 		{
-			enum machine_kind other_machine = ctx.machine == machine_kind_build ? machine_kind_host : machine_kind_build;
+			enum machine_kind other_machine = ctx.machine == machine_kind_build ? machine_kind_host :
+											      machine_kind_build;
 			enum dep_lib_mode _lib_mode;
 			if (check_dependency_override_for_machine(wk, &ctx, other_machine, &_lib_mode)) {
-				LOG_N("a dependency with the same name is available for the %s machine\n", machine_kind_to_s(other_machine));
+				LOG_N("a dependency with the same name is available for the %s machine\n",
+					machine_kind_to_s(other_machine));
 			}
 		}
 
@@ -1108,7 +1314,7 @@ deps_determine_machine_list(struct workspace *wk, obj list, enum machine_kind *m
 			switch (dep->type) {
 			case dependency_type_pkgconf:
 			case dependency_type_external_library:
-			case dependency_type_appleframeworks: {
+			case dependency_type_system: {
 				*m = dep->machine;
 				return true;
 			}
@@ -1176,7 +1382,7 @@ deps_check_machine_matches_list(struct workspace *wk, obj tgt_name, enum machine
 			switch (dep->type) {
 			case dependency_type_pkgconf:
 			case dependency_type_external_library:
-			case dependency_type_appleframeworks: break;
+			case dependency_type_system: break;
 			case dependency_type_declared: {
 				if (dep->machine == machine_kind_either) {
 					break;
@@ -1252,7 +1458,7 @@ func_declare_dependency(struct workspace *wk, obj _, obj *res)
 		[kw_dependencies] = { "dependencies", TYPE_TAG_LISTIFY | tc_dependency },
 		[kw_version] = { "version", obj_string },
 		[kw_include_directories] = { "include_directories", TYPE_TAG_LISTIFY | tc_coercible_inc },
-		[kw_variables] = { "variables", tc_array | tc_dict },
+		[kw_variables] = { "variables", tc_string | tc_array | tc_dict },
 		[kw_compile_args] = { "compile_args", TYPE_TAG_LISTIFY | obj_string },
 		[kw_objects] = { "objects", TYPE_TAG_LISTIFY | tc_file | tc_string },
 		[kw_extra_files] = { "extra_files", TYPE_TAG_LISTIFY | tc_coercible_files }, // ignored
@@ -1490,47 +1696,51 @@ build_dep_merge(struct workspace *wk,
 	}
 }
 
-static enum iteration_result
-dedup_link_args_iter(struct workspace *wk, void *_ctx, obj val)
+static bool
+obj_array_pair_in(struct workspace *wk, obj arr, obj a, obj b)
 {
-	obj new_args = *(obj *)_ctx;
-
-	static const char *known[] = {
-		"-pthread",
-	};
-
-	const char *s = get_cstr(wk, val);
-
-	uint32_t i;
-	for (i = 0; i < ARRAY_LEN(known); ++i) {
-		if (strcmp(known[i], s) == 0) {
-			if (obj_array_in(wk, new_args, val)) {
-				return ir_cont;
-			} else {
-				break;
+	obj prev = 0, v;
+	obj_array_for(wk, arr, v) {
+		if (prev) {
+			if (obj_equal(wk, a, prev) && obj_equal(wk, b, v)) {
+				return true;
 			}
 		}
+
+		prev = v;
 	}
 
-	obj_array_push(wk, new_args, val);
-	return ir_cont;
+	return false;
 }
 
-static enum iteration_result
-dedup_compile_args_iter(struct workspace *wk, void *_ctx, obj val)
+static bool
+is_joined_arg(const struct str *s, const struct str *prefix)
 {
-	obj new_args = *(obj *)_ctx;
+	return s->len > prefix->len && str_startswith(s, prefix);
+}
 
-	const struct str *s = get_str(wk, val);
-
-	if (str_eql(s, &STR("-pthread")) || str_startswith(s, &STR("-W")) || str_startswith(s, &STR("-D"))) {
-		if (obj_array_in(wk, new_args, val)) {
-			return ir_cont;
+static bool
+is_any_joined_arg(const struct str *s, const struct str *prefixes, uint32_t len)
+{
+	for (uint32_t i = 0; i < len; ++i) {
+		if (is_joined_arg(s, &prefixes[i])) {
+			return true;
 		}
 	}
 
-	obj_array_push(wk, new_args, val);
-	return ir_cont;
+	return false;
+}
+
+static bool
+is_any_str(const struct str *s, const struct str *strs, uint32_t len)
+{
+	for (uint32_t i = 0; i < len; ++i) {
+		if (str_eql(s, &strs[i])) {
+			return true;
+		}
+	}
+
+	return false;
 }
 
 static void
@@ -1551,15 +1761,70 @@ dedup_build_dep(struct workspace *wk, struct build_dep *dep)
 	obj_array_dedup_in_place(wk, &dep->sources);
 	obj_array_dedup_in_place(wk, &dep->objects);
 
-	obj new_link_args;
-	new_link_args = make_obj(wk, obj_array);
-	obj_array_foreach(wk, dep->link_args, &new_link_args, dedup_link_args_iter);
-	dep->link_args = new_link_args;
+	{
+		obj arg, new_args = make_obj(wk, obj_array);
+		obj prev = 0;
+		const struct str *prev_s = 0;
 
-	obj new_compile_args;
-	new_compile_args = make_obj(wk, obj_array);
-	obj_array_foreach(wk, dep->compile_args, &new_compile_args, dedup_compile_args_iter);
-	dep->compile_args = new_compile_args;
+		obj_array_for(wk, dep->link_args, arg) {
+			bool add = true;
+			const struct str *s = get_str(wk, arg);
+			if (str_eql(s, &STR("-pthread"))) {
+				if (obj_array_in(wk, new_args, arg)) {
+					add = false;
+				}
+			} else if (prev_s && str_eql(prev_s, &STR("-framework"))) {
+				if (obj_array_pair_in(wk, new_args, prev, arg)) {
+					obj_array_pop(wk, new_args);
+					add = false;
+				}
+			}
+
+			if (add) {
+				obj_array_push(wk, new_args, arg);
+			}
+
+			prev = arg;
+			prev_s = s;
+		}
+		dep->link_args = new_args;
+	}
+
+	{
+		obj arg, new_args = make_obj(wk, obj_array);
+		obj prev = 0;
+		const struct str *prev_s = 0;
+
+		const struct str to_dedup[] = {
+			STR("-W"),
+			STR("-D"),
+			STR("-I"),
+		};
+
+		obj_array_for(wk, dep->compile_args, arg) {
+			bool add = true;
+			const struct str *s = get_str(wk, arg);
+			if (str_eql(s, &STR("-pthread")) || is_any_joined_arg(s, to_dedup, ARRAY_LEN(to_dedup))) {
+				if (obj_array_in(wk, new_args, arg)) {
+					add = false;
+				}
+			} else if (prev_s && is_any_str(s, to_dedup, ARRAY_LEN(to_dedup))) {
+				if (obj_array_pair_in(wk, new_args, prev, arg)) {
+					obj_array_pop(wk, new_args);
+					add = false;
+				}
+			}
+
+			if (add) {
+				obj_array_push(wk, new_args, arg);
+			}
+
+			prev = arg;
+			prev_s = s;
+		}
+		dep->compile_args = new_args;
+	}
+
 	TracyCZoneAutoE;
 }
 

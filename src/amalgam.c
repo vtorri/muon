@@ -67,8 +67,10 @@
 #include "functions/machine.c"
 #include "functions/meson.c"
 #include "functions/modules.c"
+#include "functions/modules/curl.c"
 #include "functions/modules/fs.c"
 #include "functions/modules/getopt.c"
+#include "functions/modules/json.c"
 #include "functions/modules/keyval.c"
 #include "functions/modules/pkgconfig.c"
 #include "functions/modules/python.c"
@@ -145,13 +147,8 @@
 #include "platform/posix/uname.c"
 #endif
 
-#if defined(BOOTSTRAP_NO_PKGCONFIG)
-#include "external/pkgconfig_null.c"
-#elif defined(BOOTSTRAP_HAVE_LIBPKGCONF)
-#include "external/libpkgconf.c"
-#else
+#include "external/pkgconfig.c"
 #include "external/pkgconfig_exec.c"
-#endif
 
 #ifdef BOOTSTRAP_NO_SAMU
 #include "external/samurai_null.c"

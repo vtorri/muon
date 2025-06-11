@@ -105,7 +105,7 @@ enum feature_opt_state {
 	feature_opt_disabled,
 };
 
-#define FOREACH_BUILTIN_MODULE(_)                                                  \
+#define FOREACH_BUILTIN_MODULE(_)                                               \
 	_(fs, "public/fs", true)                                                \
 	_(keyval, "public/keyval", true)                                        \
 	_(pkgconfig, "public/pkgconfig", true)                                  \
@@ -115,6 +115,8 @@ enum feature_opt_state {
 	_(toolchain, "private/toolchain", true)                                 \
 	_(subprojects, "private/subprojects", true)                             \
 	_(getopt, "private/getopt", true)                                       \
+	_(curl, "private/curl", true)                                           \
+	_(json, "private/json", true)                                           \
 	_(cmake, "public/cmake", false)                                         \
 	_(dlang, "public/dlang", false)                                         \
 	_(gnome, "public/gnome", false)                                         \
@@ -331,8 +333,17 @@ enum dependency_type {
 	dependency_type_pkgconf,
 	dependency_type_threads,
 	dependency_type_external_library,
-	dependency_type_appleframeworks,
+	dependency_type_system,
 	dependency_type_not_found,
+};
+
+enum dependency_public_type {
+	dependency_public_type_unset,
+	dependency_public_type_internal,
+	dependency_public_type_pkgconfig,
+	dependency_public_type_system,
+	dependency_public_type_library,
+	dependency_public_type_not_found,
 };
 
 enum dep_flags {
@@ -354,6 +365,7 @@ struct obj_dependency {
 
 	enum dep_flags flags;
 	enum dependency_type type;
+	enum dependency_public_type public_type;
 	enum include_type include_type;
 	enum machine_kind machine;
 };
@@ -423,6 +435,7 @@ struct obj_compiler {
 	uint32_t type[toolchain_component_count];
 	obj ver;
 	obj libdirs;
+	obj fwdirs;
 	enum compiler_language lang;
 	enum machine_kind machine;
 };
@@ -452,6 +465,7 @@ struct obj_environment {
 struct obj_include_directory {
 	obj path;
 	bool is_system;
+	bool is_idirafter;
 };
 
 enum build_option_type {
@@ -461,6 +475,7 @@ enum build_option_type {
 	op_integer,
 	op_array,
 	op_feature,
+	op_shell_array,
 	build_option_type_count,
 };
 
@@ -618,7 +633,7 @@ struct tstr;
 const char *obj_type_to_s(enum obj_type t);
 bool s_to_type_tag(const char *s, type_tag *t);
 void obj_to_s(struct workspace *wk, obj o, struct tstr *sb);
-void obj_to_json(struct workspace *wk, obj o, struct tstr *sb);
+bool obj_to_json(struct workspace *wk, obj o, struct tstr *sb);
 bool obj_equal(struct workspace *wk, obj left, obj right);
 bool obj_clone(struct workspace *wk_src, struct workspace *wk_dest, obj val, obj *ret);
 

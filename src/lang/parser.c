@@ -106,6 +106,7 @@ node_type_to_s(enum node_type t)
 
 	switch (t) {
 		nt(bool);
+		nt(null);
 		nt(id);
 		nt(id_lit);
 		nt(number);
@@ -480,12 +481,24 @@ parse_number(struct parser *p, bool assignment_allowed)
 	return make_node_t(p, node_type_number);
 }
 
+static bool
+id_is_assignable(const struct str *id)
+{
+	return !(str_eql(id, &STR("meson")) || str_eql(id, &STR("build_machine")) || str_eql(id, &STR("host_machine"))
+		 || str_eql(id, &STR("target_machine")));
+}
+
 static struct node *
 parse_id(struct parser *p, bool assignment_allowed)
 {
 	struct node *id = make_node_t(p, node_type_id);
 
 	if (assignment_allowed && (parse_accept(p, '=') || parse_accept(p, token_type_plus_assign))) {
+		if (!id_is_assignable(get_str(p->wk, id->data.str))) {
+			parse_error(p, &id->location, "'%s' is not assignable", get_str(p->wk, id->data.str)->s);
+			return id;
+		}
+
 		struct node *n = make_node_assign(p, 0);
 		n->location = id->location;
 		id->type = node_type_id_lit;
@@ -493,7 +506,7 @@ parse_id(struct parser *p, bool assignment_allowed)
 		n->r = parse_expr(p);
 		return n;
 	} else {
-		return make_node_t(p, node_type_id);
+		return id;
 	}
 }
 
@@ -509,6 +522,12 @@ parse_bool(struct parser *p, bool assignment_allowed)
 	struct node *n = make_node_t(p, node_type_bool);
 	n->data.num = p->previous.type == token_type_true;
 	return n;
+}
+
+static struct node *
+parse_null(struct parser *p, bool assignment_allowed)
+{
+	return make_node_t(p, node_type_null);
 }
 
 static struct node *
@@ -729,6 +748,9 @@ parse_type(struct parser *p, type_tag *type, bool top_level)
 			parse_error(p, NULL, "unknown type %s", typestr);
 			return false;
 		}
+	} else if (parse_accept(p, token_type_null)) {
+		typestr = "null";
+		*type = TYPE_TAG_ALLOW_NULL;
 	} else {
 		return true;
 	}
@@ -1237,6 +1259,7 @@ static const struct parse_rule parse_rules_base[token_type_count] = {
 	[token_type_fstring]     = { parse_fstring,  0,             0                           },
 	[token_type_true]        = { parse_bool,     0,             0                           },
 	[token_type_false]       = { parse_bool,     0,             0                           },
+	[token_type_null]        = { parse_null,     0,             0                           },
 	['(']                    = { parse_grouping, parse_call,    parse_precedence_call       },
 	['[']                    = { parse_array,    parse_index,   parse_precedence_call       },
 	['{']                    = { parse_dict,     0,             0                           },

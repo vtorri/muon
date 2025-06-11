@@ -10,12 +10,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "args.h"
 #include "buf_size.h"
 #include "coerce.h"
+#include "error.h"
 #include "functions/string.h"
 #include "lang/func_lookup.h"
 #include "lang/lexer.h"
+#include "lang/object_iterators.h"
 #include "lang/typecheck.h"
+#include "platform/assert.h"
 #include "rpmvercmp.h"
 #include "util.h"
 
@@ -249,17 +253,11 @@ func_join(struct workspace *wk, obj self, obj *res)
 	return obj_array_join(wk, true, an[0].val, self, res);
 }
 
-struct version_compare_ctx {
-	bool res;
-	uint32_t err_node;
-	const struct str *ver1;
-};
-
-static enum iteration_result
-version_compare_iter(struct workspace *wk, void *_ctx, obj s2)
+bool
+version_compare(const struct str *ver1, const struct str *_ver2)
 {
-	struct version_compare_ctx *ctx = _ctx;
-	struct str ver2 = *get_str(wk, s2);
+	struct str ver2 = *_ver2;
+
 	enum op_type {
 		op_ge,
 		op_gt,
@@ -274,34 +272,13 @@ version_compare_iter(struct workspace *wk, void *_ctx, obj s2)
 		const struct str name;
 		enum op_type op;
 	} ops[] = {
-		{
-			STR(">="),
-			op_ge,
-		},
-		{
-			STR(">"),
-			op_gt,
-		},
-		{
-			STR("=="),
-			op_eq,
-		},
-		{
-			STR("!="),
-			op_ne,
-		},
-		{
-			STR("<="),
-			op_le,
-		},
-		{
-			STR("<"),
-			op_lt,
-		},
-		{
-			STR("="),
-			op_eq,
-		},
+		{ STR(">="), op_ge },
+		{ STR(">"), op_gt },
+		{ STR("=="), op_eq },
+		{ STR("!="), op_ne },
+		{ STR("<="), op_le },
+		{ STR("<"), op_lt },
+		{ STR("="), op_eq },
 	};
 
 	uint32_t i;
@@ -314,37 +291,29 @@ version_compare_iter(struct workspace *wk, void *_ctx, obj s2)
 		}
 	}
 
-	int8_t cmp = rpmvercmp(ctx->ver1, &ver2);
+	int8_t cmp = rpmvercmp(ver1, &ver2);
 
 	switch (op) {
-	case op_eq: ctx->res = cmp == 0; break;
-	case op_ne: ctx->res = cmp != 0; break;
-	case op_gt: ctx->res = cmp == 1; break;
-	case op_ge: ctx->res = cmp >= 0; break;
-	case op_lt: ctx->res = cmp == -1; break;
-	case op_le: ctx->res = cmp <= 0; break;
+	case op_eq: return cmp == 0; break;
+	case op_ne: return cmp != 0; break;
+	case op_gt: return cmp == 1; break;
+	case op_ge: return cmp >= 0; break;
+	case op_lt: return cmp == -1; break;
+	case op_le: return cmp <= 0; break;
+	default: UNREACHABLE_RETURN;
 	}
-
-	if (!ctx->res) {
-		return ir_done;
-	}
-
-	return ir_cont;
 }
 
 bool
-version_compare(struct workspace *wk, uint32_t err_node, const struct str *ver, obj cmp_arr, bool *res)
+version_compare_list(struct workspace *wk, const struct str *ver, obj cmp_arr)
 {
-	struct version_compare_ctx ctx = {
-		.err_node = err_node,
-		.ver1 = ver,
-	};
-
-	if (!obj_array_foreach(wk, cmp_arr, &ctx, version_compare_iter)) {
-		return false;
+	obj o;
+	obj_array_for(wk, cmp_arr, o) {
+		if (!version_compare(ver, get_str(wk, o))) {
+			return false;
+		}
 	}
 
-	*res = ctx.res;
 	return true;
 }
 
@@ -357,16 +326,9 @@ func_version_compare(struct workspace *wk, obj self, obj *res)
 		return false;
 	}
 
-	struct version_compare_ctx ctx = {
-		.err_node = an[0].node,
-		.ver1 = get_str(wk, self),
-	};
+	bool matches = version_compare(get_str(wk, self), get_str(wk, an[0].val));
 
-	if (version_compare_iter(wk, &ctx, an[0].val) == ir_err) {
-		return false;
-	}
-
-	*res = make_obj_bool(wk, ctx.res);
+	*res = make_obj_bool(wk, matches);
 	return true;
 }
 
@@ -559,6 +521,61 @@ func_string_length(struct workspace *wk, obj self, obj *res)
 	return true;
 }
 
+static bool
+string_shell_common(struct workspace *wk, enum shell_type *shell)
+{
+	if (vm_enum(wk, shell_type)) {
+		vm_enum_value_prefixed(wk, shell_type, posix);
+		vm_enum_value_prefixed(wk, shell_type, cmd);
+	}
+
+	enum kwargs { kw_shell };
+	struct args_kw akw[] = { [kw_shell] = { "shell", complex_type_preset_get(wk, tc_cx_enum_shell) }, 0 };
+	if (!pop_args(wk, 0, akw)) {
+		return false;
+	}
+
+	*shell = shell_type_posix;
+	if (akw[kw_shell].set && !vm_obj_to_enum(wk, shell_type, akw[kw_shell].val, shell)) {
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+func_string_shell_split(struct workspace *wk, obj self, obj *res)
+{
+	enum shell_type shell;
+	if (!string_shell_common(wk, &shell)) {
+		return false;
+	}
+
+	*res = str_shell_split(wk, get_str(wk, self), shell);
+	return true;
+}
+
+static bool
+func_string_shell_quote(struct workspace *wk, obj self, obj *res)
+{
+	enum shell_type shell;
+	if (!string_shell_common(wk, &shell)) {
+		return false;
+	}
+
+	void (*escape_func)(struct workspace *wk, struct tstr *sb, const char *str) = 0;
+
+	switch (shell) {
+	case shell_type_posix: escape_func = shell_escape; break;
+	case shell_type_cmd: escape_func = shell_escape_cmd; break;
+	}
+
+	TSTR(buf);
+	escape_func(wk, &buf, get_str(wk, self)->s);
+	*res = tstr_into_str(wk, &buf);
+	return true;
+}
+
 const struct func_impl impl_tbl_string_internal[] = {
 	{ "contains", func_string_contains, tc_bool, true },
 	{ "endswith", func_string_endswith, tc_bool, true },
@@ -576,5 +593,7 @@ const struct func_impl impl_tbl_string_internal[] = {
 	{ "underscorify", func_underscorify, tc_string, true },
 	{ "version_compare", func_version_compare, tc_bool, true },
 	{ "length", func_string_length, tc_number, true },
+	{ "shell_split", func_string_shell_split, tc_array, true },
+	{ "shell_quote", func_string_shell_quote, tc_string, true },
 	{ NULL, NULL },
 };

@@ -26,7 +26,7 @@ struct workspace;
 #define STRL(__str)                              \
 	(struct str)                             \
 	{                                        \
-		.s = __str, .len = strlen(__str) \
+		.s = __str, .len = (uint32_t)strlen(__str) \
 	}
 
 /* tstr - Temporary STRing
@@ -83,6 +83,7 @@ void tstr_pushf(struct workspace *wk, struct tstr *sb, const char *fmt, ...) MUO
 void tstr_vpushf(struct workspace *wk, struct tstr *sb, const char *fmt, va_list args);
 void tstr_push_json_escaped(struct workspace *wk, struct tstr *buf, const char *str, uint32_t len);
 void tstr_push_json_escaped_quoted(struct workspace *wk, struct tstr *buf, const struct str *str);
+void tstr_trim_trailing_newline(struct tstr *sb);
 obj tstr_into_str(struct workspace *wk, struct tstr *sb);
 
 /* str - strings
@@ -147,11 +148,21 @@ obj str_split_strip(struct workspace *wk, const struct str *ss, const struct str
 bool str_split_in_two(const struct str *s, struct str *l, struct str *r, char split);
 void str_to_lower(struct str *str);
 
-void cstr_copy(char *dest, const char *src, uint32_t dest_len);
+void cstr_copy_(char *dest, const struct str *src, uint32_t dest_len);
+#define cstr_copy(__dest, __src) cstr_copy_(__dest, __src, ARRAY_LEN(__dest));
 
 bool is_whitespace(char c);
 bool is_whitespace_except_newline(char c);
 
 void snprintf_append_(char *buf, uint32_t buf_len, uint32_t *buf_i, const char *fmt, ...) MUON_ATTR_FORMAT(printf, 4, 5);
 #define snprintf_append(__buf, __buf_i, __fmt, ...) snprintf_append_(__buf, sizeof(__buf), __buf_i, __fmt, __VA_ARGS__)
+
+enum shell_type {
+	shell_type_posix,
+	shell_type_cmd,
+};
+enum shell_type shell_type_for_host_machine(void);
+obj str_shell_split(struct workspace *wk, const struct str *str, enum shell_type shell);
+
+bool str_fuzzy_match(const struct str *input, const struct str *guess, int32_t *dist);
 #endif

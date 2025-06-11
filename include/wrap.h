@@ -28,6 +28,7 @@ enum wrap_fields {
 	wf_patch_hash,
 	wf_patch_directory,
 	wf_diff_files,
+	wf_method,
 
 	// wrap-file
 	wf_source_url,
@@ -63,7 +64,7 @@ struct wrap {
 	char *buf;
 	char dest_dir_buf[BUF_SIZE_1k], name_buf[BUF_SIZE_1k];
 	struct tstr dest_dir, name;
-	bool dirty, outdated, updated, apply_patch;
+	bool dirty, outdated, updated;
 };
 
 enum wrap_provides_key {
@@ -115,7 +116,7 @@ struct wrap_handle_ctx {
 		uint8_t *buf;
 		uint64_t len;
 		int64_t downloaded, total;
-		const char *hash, *dest_dir;
+		const char *hash, *dest_dir, *filename;
 	} fetch_ctx;
 
 	struct run_cmd_ctx cmd_ctx;
@@ -127,10 +128,12 @@ struct wrap_handle_ctx {
 
 	char tstr_buf[2][1024];
 	struct tstr bufs[2];
+
+	bool ok;
 };
 
 void wrap_destroy(struct wrap *wrap);
-bool wrap_parse(struct workspace *wk, const char *wrap_file, struct wrap *wrap);
+bool wrap_parse(struct workspace *wk, const char *subprojects, const char *wrap_file, struct wrap *wrap);
 bool wrap_handle(struct workspace *wk, const char *wrap_file, struct wrap_handle_ctx *ctx);
 void wrap_handle_async_start(struct workspace *wk);
 void wrap_handle_async_end(struct workspace *wk);

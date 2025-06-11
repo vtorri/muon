@@ -1951,11 +1951,15 @@ vm_op_member(struct workspace *wk)
 		return;
 	}
 
-	obj res;
-	res = make_obj(wk, obj_capture);
+	obj  res = make_obj(wk, obj_capture);
 	struct obj_capture *c = get_obj_capture(wk, res);
 
 	if (f) {
+		if (get_obj_type(wk, f) == obj_typeinfo) {
+			vm_push_dummy(wk);
+			return;
+		}
+
 		*c = *get_obj_capture(wk, f);
 	} else {
 		c->native_func = idx;
@@ -1978,7 +1982,11 @@ vm_op_call(struct workspace *wk)
 
 	obj f = object_stack_pop(&wk->vm.stack);
 
-	unop_disabler_check(f);
+	if (f == obj_disabler) {
+		object_stack_discard(&wk->vm.stack, wk->vm.nargs + wk->vm.nkwargs * 2);
+		object_stack_push(wk, obj_disabler);
+		return;
+	}
 
 	if (wk->vm.in_analyzer && get_obj_type(wk, f) == obj_typeinfo) {
 		object_stack_discard(&wk->vm.stack, wk->vm.nargs + wk->vm.nkwargs * 2);
@@ -2189,7 +2197,9 @@ vm_op_iterator_next(struct workspace *wk)
 		}
 		break;
 	case obj_iterator_type_typeinfo: {
-		if (iterator->data.typeinfo.i) {
+		// Let it loop twice to catch all variables modified in this impure
+		// loop.
+		if (iterator->data.typeinfo.i > 1) {
 			should_break = true;
 			break;
 		}
@@ -2727,9 +2737,8 @@ vm_execute_loop(struct workspace *wk)
 {
 	uint32_t cip;
 	while (wk->vm.run) {
-		/* LL("%-50s", vm_dis_inst(wk, wk->vm.code.e, wk->vm.ip)); */
-		/* object_stack_print(wk, &wk->vm.stack); */
-		/* L("%5.2f", (double)wk->vm.ip / (double)wk->vm.code.len * 100.0); */
+		// LL("%-50s", vm_dis_inst(wk, wk->vm.code.e, wk->vm.ip));
+		// object_stack_print(wk, &wk->vm.stack);
 
 		log_progress(wk, wk->vm.ip);
 
@@ -2774,6 +2783,8 @@ vm_types_init(struct workspace *wk)
 	if (!wk->vm.types.structs) {
 		wk->vm.types.structs = make_obj(wk, obj_dict);
 		wk->vm.types.enums = make_obj(wk, obj_dict);
+		wk->vm.types.docs = make_obj(wk, obj_dict);
+		wk->vm.types.top_level_docs = make_obj(wk, obj_dict);
 	}
 }
 
@@ -2815,9 +2826,100 @@ vm_struct_(struct workspace *wk, const char *name)
 	return vm_register_common(wk, wk->vm.types.structs, name);
 }
 
+const char *
+vm_enum_docs_def(struct workspace *wk, obj def) {
+	obj doc;
+	if (obj_dict_geti(wk, wk->vm.types.docs, def, &doc)) {
+		return get_str(wk, doc)->s;
+	}
+
+	obj arr = make_obj(wk, obj_array);
+	obj k, v;
+	obj_dict_for(wk, def, k, v) {
+		obj_array_push(wk, arr, k);
+	}
+
+	obj_array_join(wk, false, arr, make_str(wk, "|"), &doc);
+
+	obj_dict_seti(wk, wk->vm.types.docs, def, doc);
+	return get_str(wk, doc)->s;
+}
+
+const char *
+vm_struct_docs_def(struct workspace *wk, obj def) {
+	obj doc;
+	if (obj_dict_geti(wk, wk->vm.types.docs, def, &doc)) {
+		return get_str(wk, doc)->s;
+	}
+
+	obj arr = make_obj(wk, obj_array);
+
+	obj k, v;
+	obj_dict_for(wk, def, k, v) {
+		obj t = obj_array_index(wk, v, 1);
+		enum vm_struct_type type = t & vm_struct_type_mask;
+		const char *type_str = 0;
+
+		switch (type) {
+		case vm_struct_type_struct_:
+			type_str = vm_struct_docs_def(wk, t >> vm_struct_type_shift);
+			break;
+		case vm_struct_type_enum_:
+			type_str = vm_enum_docs_def(wk, t >> vm_struct_type_shift);
+			break;
+		case vm_struct_type_bool:
+			type_str = "bool";
+			break;
+		case vm_struct_type_str:
+			type_str = "str";
+			break;
+		case vm_struct_type_obj:
+			type_str = "any";
+			break;
+		}
+
+		assert(type_str);
+
+		obj_array_push(wk, arr, make_strf(wk, "%s?: %s", get_str(wk, k)->s, type_str));
+	}
+
+	obj joined;
+	obj_array_join(wk, false, arr, make_str(wk, ",\n\t"), &joined);
+
+	TSTR(buf);
+	tstr_pushf(wk, &buf, "{\n\t%s\n}", get_str(wk, joined)->s);
+
+	doc = tstr_into_str(wk, &buf);
+	obj_dict_seti(wk, wk->vm.types.docs, def, doc);
+	return get_str(wk, doc)->s;
+}
+
+const char *
+vm_struct_docs_(struct workspace *wk, const char *name, const char *fmt) {
+	vm_types_init(wk);
+
+	obj doc;
+	if (obj_dict_index_str(wk, wk->vm.types.top_level_docs, name, &doc)) {
+		return get_str(wk, doc)->s;
+	}
+
+	obj def;
+	if (!obj_dict_index_str(wk, wk->vm.types.structs, name, &def)) {
+		error_unrecoverable("struct %s is not registered", name);
+	}
+
+	const char *doc_str = vm_struct_docs_def(wk, def);
+
+	TSTR(buf);
+	tstr_pushf(wk, &buf, fmt, doc_str);
+
+	doc = tstr_into_str(wk, &buf);
+	obj_dict_set(wk, wk->vm.types.top_level_docs, make_str(wk, name), doc);
+	return get_str(wk, doc)->s;
+}
+
 void
-vm_struct_member_(struct workspace *wk, const char *name, const char *member, uint32_t offset, enum vm_struct_type t)
-{
+vm_struct_member_(struct workspace *wk, const char *name, const char *member, uint32_t offset, enum vm_struct_type t) {
 	obj def;
 	if (!obj_dict_index_str(wk, wk->vm.types.structs, name, &def)) {
 		error_unrecoverable("struct %s is not registered", name);
@@ -2904,7 +3006,7 @@ vm_obj_to_struct_def(struct workspace *wk, obj def, obj o, void *s)
 			if (!typecheck_custom(wk, 0, v, expected_type, 0)) {
 				goto type_err;
 			}
-			*(const char **)dest = get_cstr(wk, v);
+			*(const struct str **)dest = get_str(wk, v);
 			break;
 		case vm_struct_type_obj: *(obj *)dest = v; break;
 		}

@@ -90,7 +90,11 @@ fix_file_path(struct workspace *wk, uint32_t err_node, obj path, enum fix_file_p
 				return false;
 			}
 
-			path_join(wk, buf, home, &s[1]);
+			if (s[1] == '/' && s[2]) {
+				path_join(wk, buf, home, &s[2]);
+			} else {
+				path_copy(wk, buf, home);
+			}
 		} else if (opts & fix_file_path_noabs) {
 			path_copy(wk, buf, s);
 		} else {
@@ -363,11 +367,7 @@ func_module_fs_hash(struct workspace *wk, obj self, obj *res)
 	calc_sha_256(hash, src.src, src.len); // TODO: other hash algos
 
 	char buf[65] = { 0 };
-	uint32_t i, bufi = 0;
-	for (i = 0; i < 32; ++i) {
-		snprintf(&buf[bufi], 3, "%x", hash[i]);
-		bufi += 2;
-	}
+	sha256_to_str(hash, buf);
 
 	*res = make_str(wk, buf);
 
@@ -987,7 +987,6 @@ func_module_fs_canonicalize(struct workspace *wk, obj self, obj *res)
 
 const struct func_impl impl_tbl_module_fs_internal[] = {
 	{ "as_posix", func_module_fs_as_posix, tc_string, true },
-	{ "copyfile", func_module_fs_copyfile },
 	{ "exists", func_module_fs_exists, tc_bool },
 	{ "expanduser", func_module_fs_expanduser, tc_string },
 	{ "hash", func_module_fs_hash, tc_string },

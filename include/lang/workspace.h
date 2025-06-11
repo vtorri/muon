@@ -23,6 +23,7 @@ struct project {
 	obj opts, targets, tests, test_setups, summary;
 	struct {
 		obj static_deps[machine_kind_count], shared_deps[machine_kind_count];
+		obj frameworks[machine_kind_count];
 	} dep_cache;
 	obj wrap_provides_deps, wrap_provides_exes;
 
@@ -65,6 +66,8 @@ struct workspace {
 	obj dep_overrides_static[machine_kind_count], dep_overrides_dynamic[machine_kind_count];
 	/* overridden find_program dict */
 	obj find_program_overrides[machine_kind_count];
+	/* dict[str] */
+	obj machine_properties[machine_kind_count];
 
 	/* TODO host machine dict */
 	obj host_machine;
@@ -88,8 +91,6 @@ struct workspace {
 	obj dependency_handlers;
 	/* list[str], used for error reporting */
 	obj backend_output_stack;
-	/* list[capture] */
-	obj finalizers;
 	/* ----------------- */
 
 	struct vm vm;
@@ -113,8 +114,7 @@ void workspace_init_startup_files(struct workspace *wk);
 void workspace_init(struct workspace *wk);
 void workspace_destroy_bare(struct workspace *wk);
 void workspace_destroy(struct workspace *wk);
-bool
-workspace_setup_paths(struct workspace *wk, const char *build, const char *argv0, uint32_t argc, char *const argv[]);
+void workspace_setup_paths(struct workspace *wk, const char *build, const char *argv0, uint32_t argc, char *const argv[]);
 void workspace_add_exclude_regenerate_dep(struct workspace *wk, obj v);
 void workspace_add_regenerate_dep(struct workspace *wk, obj v);
 void workspace_add_regenerate_deps(struct workspace *wk, obj obj_or_arr);
@@ -122,7 +122,7 @@ void workspace_add_regenerate_deps(struct workspace *wk, obj obj_or_arr);
 struct project *
 make_project(struct workspace *wk, uint32_t *id, const char *subproject_name, const char *cwd, const char *build_dir);
 struct project *current_project(struct workspace *wk);
-
+const char *workspace_build_dir(struct workspace *wk);
 const char *workspace_cwd(struct workspace *wk);
 
 void workspace_print_summaries(struct workspace *wk, FILE *out);

@@ -16,6 +16,7 @@
 #include "buf_size.h"
 #include "compilers.h"
 #include "error.h"
+#include "functions/string.h"
 #include "guess.h"
 #include "lang/object_iterators.h"
 #include "lang/typecheck.h"
@@ -1053,6 +1054,15 @@ TOOLCHAIN_PROTO_1s(compiler_gcc_args_include_system)
 	return &args;
 }
 
+TOOLCHAIN_PROTO_1s(compiler_gcc_args_include_dirafter)
+{
+	TOOLCHAIN_ARGS({ "-idirafter", NULL });
+
+	argv[1] = s1;
+
+	return &args;
+}
+
 TOOLCHAIN_PROTO_2s(compiler_gcc_args_deps)
 {
 	TOOLCHAIN_ARGS({ "-MD", "-MQ", NULL, "-MF", NULL });
@@ -1316,6 +1326,12 @@ TOOLCHAIN_PROTO_1s(compiler_gcc_args_color_output)
 {
 	static char buf[BUF_SIZE_S];
 	TOOLCHAIN_ARGS({ buf });
+
+	if (comp->type[toolchain_component_compiler] == compiler_gcc
+		&& (!comp->ver || version_compare(get_str(wk, comp->ver), &STR("<4.9.0")))) {
+		args.len = 0;
+		return &args;
+	}
 
 	snprintf(buf, BUF_SIZE_S, "-fdiagnostics-color=%s", s1);
 
@@ -1873,6 +1889,7 @@ build_compilers(void)
 	gcc.args.winvalid_pch = compiler_gcc_args_winvalid_pch;
 	gcc.args.set_std = compiler_gcc_args_set_std;
 	gcc.args.include_system = compiler_gcc_args_include_system;
+	gcc.args.include_dirafter = compiler_gcc_args_include_dirafter;
 	gcc.args.pgo = compiler_gcc_args_pgo;
 	gcc.args.pic = compiler_gcc_args_pic;
 	gcc.args.pie = compiler_gcc_args_pie;

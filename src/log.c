@@ -130,7 +130,15 @@ void
 log_progress_disable(void)
 {
 	struct log_progress *lp = &log_cfg.progress;
+	if (!lp->init) {
+		return;
+	}
+
 	lp->init = false;
+
+	if (log_cfg.file_is_a_tty) {
+		log_raw("\033[K");
+	}
 }
 
 void
@@ -326,14 +334,15 @@ log_printn(enum log_level lvl, const char *buf, uint32_t len)
 	}
 
 	if (log_cfg.progress.init && lvl == log_error) {
-		log_progress_disable();
-		log_raw("\033[K");
+		if (!log_cfg.progress.style.dont_disable_on_error) {
+			log_progress_disable();
+		}
 	}
 
 	if (log_cfg.tstr) {
 		tstr_pushn(0, log_cfg.tstr, buf, len);
 		tstr_push(0, log_cfg.tstr, '\n');
-	} else {
+	} else if (log_cfg.file) {
 		print_buffer(log_cfg.file,
 			buf,
 			len,
@@ -420,7 +429,7 @@ log_set_file(FILE *log_file)
 {
 	log_cfg.file = log_file;
 	log_cfg.tstr = 0;
-	log_cfg.file_is_a_tty = fs_is_a_tty(log_file);
+	log_cfg.file_is_a_tty = log_file && fs_is_a_tty(log_file);
 }
 
 void
@@ -434,8 +443,8 @@ log_set_buffer(struct tstr *buf)
 {
 	assert(buf->flags & tstr_flag_overflow_alloc);
 
+	log_set_file(0);
 	log_cfg.tstr = buf;
-	log_cfg.file = 0;
 }
 
 void

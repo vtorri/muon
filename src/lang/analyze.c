@@ -741,31 +741,6 @@ az_op_return_end(struct workspace *wk)
 	analyzer.unpatched_ops.ops[op_return_end](wk);
 }
 
-#if 0
-static void
-az_op_add_store(struct workspace *wk)
-{
-	obj a, b;
-
-	b = object_stack_pop(&wk->vm.stack);
-	obj a_id = vm_get_constant(wk->vm.code.e, &wk->vm.ip);
-
-	const struct str *id = get_str(wk, a_id);
-	if (!wk->vm.behavior.get_variable(wk, id->s, &a)) {
-		vm_error(wk, "undefined object %s", get_cstr(wk, a_id));
-		object_stack_push(wk, make_typeinfo(wk, tc_any));
-		return;
-	}
-
-	object_stack_push(wk, a);
-	object_stack_push(wk, b);
-	analyzer.unpatched_ops.ops[op_add](wk);
-
-	obj res = object_stack_peek(&wk->vm.stack, 1);
-	wk->vm.behavior.assign_variable(wk, id->s, res, 0, assign_reassign);
-}
-#endif
-
 /******************************************************************************
  * analyzer behaviors
  ******************************************************************************/
@@ -942,8 +917,9 @@ az_func_lookup(struct workspace *wk, obj self, const char *name, uint32_t *idx, 
 		uint32_t idx;
 		uint32_t matches;
 	} lookup_res = { 0 };
-	type_tag t = ti->type;
 	uint32_t i;
+
+	type_tag t = flatten_type(wk, ti->type);
 
 	// Strip disabler from type list
 	if ((t & tc_disabler) == tc_disabler) {

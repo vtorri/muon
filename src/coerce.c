@@ -441,7 +441,7 @@ coerce_into_file(struct workspace *wk, struct coerce_into_files_ctx *ctx, obj va
 			}
 			break;
 		case mode_output:
-			if (!path_is_basename(get_cstr(wk, val)) && wk->vm.lang_mode != language_extended) {
+			if (!path_is_basename(get_cstr(wk, val)) && wk->vm.lang_mode == language_external) {
 				vm_error_at(
 					wk, ctx->node, "output file '%s' contains path separators", get_cstr(wk, val));
 				return ir_err;
@@ -678,4 +678,23 @@ coerce_machine_kind(struct workspace *wk, struct args_kw *native_kw)
 	}
 
 	return machine_kind_host;
+}
+
+bool
+coerce_truthiness(struct workspace *wk, obj o)
+{
+	switch (get_obj_type(wk, o)) {
+	case obj_bool:
+		return get_obj_bool(wk, o);
+	case obj_array:
+		return get_obj_array(wk, o)->len > 0;
+	case obj_dict:
+		return get_obj_dict(wk, o)->len > 0;
+	case obj_string:
+		return get_str(wk, o)->len > 0;
+	case obj_number:
+		return get_obj_number(wk, o) != 0;
+	default:
+		return true;
+	}
 }

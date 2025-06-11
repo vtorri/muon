@@ -47,21 +47,21 @@ eval_project(struct workspace *wk,
 		L("entering subproject '%s'", subproject_name);
 	}
 
+	enum build_language lang;
+	const char *build_file = determine_build_file(wk, cwd, &lang);
+
+	if (!build_file) {
+		goto cleanup;
+	}
+
 	if (!setup_project_options(wk, cwd)) {
 		goto cleanup;
 	}
 
 	wk->vm.dbg_state.eval_trace_subdir = true;
 
-	{
-		enum build_language lang;
-		const char *build_file = determine_build_file(wk, cwd, &lang);
-
-		if (!build_file) {
-			goto cleanup;
-		} else if (!wk->vm.behavior.eval_project_file(wk, build_file, lang, eval_project_file_flag_first, 0)) {
-			goto cleanup;
-		}
+	if (!wk->vm.behavior.eval_project_file(wk, build_file, lang, eval_project_file_flag_first, 0)) {
+		goto cleanup;
 	}
 
 	if (wk->cur_project == 0 && !check_invalid_subproject_option(wk)) {
@@ -72,6 +72,7 @@ eval_project(struct workspace *wk,
 cleanup:
 	wk->vm.dbg_state.eval_trace = parent_eval_trace;
 	if (wk->cur_project > 0) {
+		L("leaving subproject '%s'", subproject_name);
 		log_set_prefix(-2);
 	}
 	wk->cur_project = parent_project;
@@ -521,7 +522,7 @@ determine_build_file(struct workspace *wk, const char *cwd, enum build_language 
 		enum build_language lang;
 	} names[] = {
 		{ "meson.build", build_language_meson },
-		{ "CMakeLists.txt", build_language_cmake },
+		// { "CMakeLists.txt", build_language_cmake },
 	};
 
 	TSTR(name);

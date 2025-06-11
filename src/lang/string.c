@@ -28,7 +28,7 @@ str_escape(struct workspace *wk, struct tstr *sb, const struct str *ss, bool esc
 	uint32_t i;
 
 	for (i = 0; i < ss->len; ++i) {
-		esc = ss->s[i] < 32 || ss->s[i] == '\'';
+		esc = ss->s[i] < 32 || ss->s[i] == '\'' || ss->s[i] == '\\';
 		if (!escape_printable && strchr("\t\n\r'", ss->s[i])) {
 			esc = false;
 		}
@@ -36,6 +36,8 @@ str_escape(struct workspace *wk, struct tstr *sb, const struct str *ss, bool esc
 		if (esc) {
 			if (ss->s[i] == '\'') {
 				tstr_pushf(wk, sb, "\\'");
+			} else if (ss->s[i] == '\\') {
+				tstr_pushf(wk, sb, "\\\\");
 			} else if (7 <= ss->s[i] && ss->s[i] <= 13) {
 				tstr_pushf(wk, sb, "\\%c", "abtnvfr"[ss->s[i] - 7]);
 			} else {
@@ -1092,11 +1094,27 @@ tstr_into_str(struct workspace *wk, struct tstr *sb)
 }
 
 void
-cstr_copy(char *dest, const char *src, uint32_t dest_len)
+tstr_trim_trailing_newline(struct tstr *sb)
 {
-	uint32_t src_len = strlen(src) + 1;
+	if (sb->buf[sb->len - 1] == '\n') {
+		--sb->len;
+		sb->buf[sb->len] = 0;
+	}
+
+	if (sb->len) {
+		if (sb->buf[sb->len - 1] == '\r') {
+			--sb->len;
+			sb->buf[sb->len] = 0;
+		}
+	}
+}
+
+void
+cstr_copy_(char *dest, const struct str *src, uint32_t dest_len)
+{
+	uint32_t src_len = src->len + 1;
 	assert(src_len <= dest_len);
-	memcpy(dest, src, src_len);
+	memcpy(dest, src->s, src_len);
 }
 
 void
@@ -1111,4 +1129,454 @@ snprintf_append_(char *buf, uint32_t buf_len, uint32_t *buf_i, const char *fmt, 
 	va_start(args, fmt);
 	*buf_i += vsnprintf(buf + *buf_i, buf_len - *buf_i, fmt, args);
 	va_end(args);
+}
+
+/* Shlex-like string splitting
+ *
+ * Reference:
+ * - https://docs.python.org/3/library/shlex.html
+ * - https://github.com/python/cpython/blob/main/Lib/shlex.py
+ * - https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html
+ * for cmd:
+ * - https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments
+ * */
+
+struct shlex_ctx {
+	const struct str str;
+	uint32_t i;
+	char c;
+};
+
+static void
+shlex_advance(struct workspace *wk, struct shlex_ctx *ctx)
+{
+	if (ctx->i > ctx->str.len) {
+		return;
+	}
+
+	++ctx->i;
+	ctx->c = ctx->str.s[ctx->i];
+}
+
+static obj
+shlex_cmd_next(struct workspace *wk, struct shlex_ctx *ctx)
+{
+	// Arguments are delimited by whitespace characters, which are either spaces or tabs.
+	while (is_whitespace(ctx->c)) {
+		shlex_advance(wk, ctx);
+	}
+
+	if (!ctx->c) {
+		return 0;
+	}
+
+	TSTR(tok);
+	char quote = 0;
+	uint32_t i, slashes;
+
+	if (ctx->c == '"') {
+		quote = '"';
+		shlex_advance(wk, ctx);
+	}
+
+	while (ctx->c) {
+		// A double quote mark preceded by a backslash (\") is interpreted
+		// as a literal double quote mark (").
+		//
+		// Backslashes are interpreted literally, unless they immediately
+		// precede a double quote mark.
+		slashes = 0;
+		while (ctx->c == '\\') {
+			++slashes;
+			shlex_advance(wk, ctx);
+		}
+
+		if (slashes) {
+			if (ctx->c != '"') {
+				for (i = 0; i < slashes; ++i) {
+					tstr_push(wk, &tok, '\\');
+				}
+			}
+		}
+
+		if (!ctx->c) {
+			goto done;
+		}
+
+		switch (ctx->c) {
+		case ' ':
+		case '\t': {
+			if (quote) {
+				tstr_push(wk, &tok, ctx->c);
+			} else {
+				goto done;
+			}
+			break;
+		}
+		case '"': {
+			// A string surrounded by double quote marks is interpreted as a
+			// single argument, whether it contains whitespace characters or
+			// not. A quoted string can be embedded in an argument. The caret
+			// (^) isn't recognized as an escape character or delimiter. Within
+			// a quoted string, a pair of double quote marks is interpreted as
+			// a single escaped double quote mark. If the command line ends
+			// before a closing double quote mark is found, then all the
+			// characters read so far are output as the last argument.
+			if (slashes && !(slashes & 1)) {
+				// If an even number of backslashes is followed by a double
+				// quote mark, then one backslash (\) is placed in the argv
+				// array for every pair of backslashes (\\), and the double
+				// quote mark (") is interpreted as a string delimiter.
+				for (i = 0; i < slashes / 2; ++i) {
+					tstr_push(wk, &tok, '\\');
+				}
+
+				if (is_whitespace(ctx->str.s[ctx->i + 1])) {
+					shlex_advance(wk, ctx);
+					goto done;
+				} else {
+					quote = '"';
+				}
+			} else if (slashes && (slashes & 1)) {
+				// If an odd number of backslashes is followed by a double
+				// quote mark, then one backslash (\) is placed in the argv
+				// array for every pair of backslashes (\\). The double quote
+				// mark is interpreted as an escape sequence by the remaining
+				// backslash, causing a literal double quote mark (") to be
+				// placed in argv.
+				for (i = 0; i < slashes / 2; ++i) {
+					tstr_push(wk, &tok, '\\');
+				}
+
+				tstr_push(wk, &tok, '"');
+			} else if (ctx->str.s[ctx->i + 1] == '"') {
+				shlex_advance(wk, ctx);
+				tstr_push(wk, &tok, '"');
+			} else if (quote) {
+				shlex_advance(wk, ctx);
+				goto done;
+			}
+			break;
+		}
+		default: {
+			tstr_push(wk, &tok, ctx->c);
+			break;
+		}
+		}
+
+		shlex_advance(wk, ctx);
+	}
+
+done:
+	return tstr_into_str(wk, &tok);
+}
+
+static obj
+shlex_posix_next(struct workspace *wk, struct shlex_ctx *ctx)
+{
+	while (is_whitespace(ctx->c)) {
+		shlex_advance(wk, ctx);
+	}
+
+	if (!ctx->c) {
+		return 0;
+	}
+
+	TSTR(tok);
+	char quote = 0;
+
+	while (ctx->c) {
+		switch (ctx->c) {
+		case '#': {
+			// If the current character is a '#', it and all subsequent
+			// characters up to, but excluding, the next <newline> shall be
+			// discarded as a comment. The <newline> that ends the line is not
+			// considered part of the comment.
+			if (quote) {
+				tstr_push(wk, &tok, ctx->c);
+			} else {
+				while (ctx->c && ctx->c != '\n') {
+					shlex_advance(wk, ctx);
+				}
+				continue;
+			}
+			break;
+		}
+		case ' ':
+		case '\t':
+		case '\n': {
+			if (quote) {
+				tstr_push(wk, &tok, ctx->c);
+			} else {
+				goto done;
+			}
+			break;
+		}
+		case '\\': {
+			shlex_advance(wk, ctx);
+			// 2.2.1 Escape Character (Backslash)
+			// A <backslash> that is not quoted shall preserve the literal
+			// value of the following character, with the exception of a
+			// <newline>.
+			if (quote == '\'') {
+				tstr_push(wk, &tok, '\\');
+				tstr_push(wk, &tok, ctx->c);
+			} else if (quote == '"') {
+				// Outside of "$(...)" and "${...}" the <backslash> shall
+				// retain its special meaning as an escape character (see 2.2.1
+				// Escape Character (Backslash)) only when immediately followed
+				// by one of the following characters:
+
+				// $   `   \   <newline>
+
+				// or by a double-quote character that would otherwise be
+				// considered special (see 2.6.4 Arithmetic Expansion and 2.7.4
+				// Here-Document).
+
+				if (strchr("$`\\\n\"", ctx->c)) {
+					tstr_push(wk, &tok, ctx->c);
+				} else {
+					tstr_push(wk, &tok, '\\');
+					tstr_push(wk, &tok, ctx->c);
+				}
+			} else if (ctx->c == '\n') {
+				// If a <newline> immediately follows the <backslash>,
+				// the shell shall interpret this as line continuation. The
+				// <backslash> and <newline> shall be removed before splitting the
+				// input into tokens.
+			} else {
+				tstr_push(wk, &tok, ctx->c);
+			}
+			break;
+		}
+		case '\'': {
+			// 2.2.2 Single-Quotes
+			// Enclosing characters in single-quotes ('') shall preserve the
+			// literal value of each character within the single-quotes. A
+			// single-quote cannot occur within single-quotes.
+			if (!quote) {
+				quote = '\'';
+			} else if (quote == '\'') {
+				quote = 0;
+			} else if (quote == '\"') {
+				tstr_push(wk, &tok, ctx->c);
+			}
+			break;
+		}
+		case '"': {
+			// 2.2.3 Double-Quotes
+			// Enclosing characters in double-quotes ("") shall preserve the
+			// literal value of all characters within the double-quotes, with
+			// the exception of the characters backquote, <dollar-sign>, and
+			// <backslash>, as follows:
+			if (!quote) {
+				quote = '\"';
+			} else if (quote == '\"') {
+				quote = 0;
+			} else if (quote == '\'') {
+				tstr_push(wk, &tok, ctx->c);
+			}
+			break;
+		}
+		default: {
+			tstr_push(wk, &tok, ctx->c);
+			break;
+		}
+		}
+
+		shlex_advance(wk, ctx);
+	}
+
+done:
+	return tstr_into_str(wk, &tok);
+}
+
+enum shell_type
+shell_type_for_host_machine(void)
+{
+	if (host_machine.is_windows) {
+		return shell_type_cmd;
+	} else {
+		return shell_type_posix;
+	}
+}
+
+obj
+str_shell_split(struct workspace *wk, const struct str *str, enum shell_type shell)
+{
+	obj tok, res = make_obj(wk, obj_array);
+
+	struct shlex_ctx ctx = { .str = *str, .c = str->s[0] };
+
+	obj (*lex_func)(struct workspace *wk, struct shlex_ctx *ctx) = 0;
+
+	switch (shell) {
+	case shell_type_posix: lex_func = shlex_posix_next; break;
+	case shell_type_cmd: lex_func = shlex_cmd_next; break;
+	}
+
+	while ((tok = lex_func(wk, &ctx))) {
+		obj_array_push(wk, res, tok);
+	}
+
+	return res;
+}
+
+static int32_t
+min3(int32_t a, int32_t b, int32_t c)
+{
+	int32_t min = a;
+	if (b < min) {
+		min = b;
+	}
+	if (c < min) {
+		min = c;
+	}
+	return min;
+}
+
+#define LEVENSHTEIN_MAX_COMPARE_LEN 256
+
+static int32_t
+str_levenshtein_distance(const struct str *a, const struct str *b)
+{
+	int32_t *v0, *v1, _v0[LEVENSHTEIN_MAX_COMPARE_LEN] = { 0 }, _v1[LEVENSHTEIN_MAX_COMPARE_LEN] = { 0 };
+	v0 = _v0;
+	v1 = _v1;
+
+	int32_t m = a->len + 1, n = b->len + 1;
+	if (m > LEVENSHTEIN_MAX_COMPARE_LEN) {
+		m = LEVENSHTEIN_MAX_COMPARE_LEN;
+	}
+	if (n > LEVENSHTEIN_MAX_COMPARE_LEN) {
+		n = LEVENSHTEIN_MAX_COMPARE_LEN;
+	}
+
+	for (int32_t i = 0; i < n; ++i) {
+		v0[i] = i;
+	}
+
+	for (int32_t i = 0; i < m - 1; ++i) {
+		v1[0] = i + 1;
+
+		for (int32_t j = 0; j < n - 1; ++j) {
+			int32_t deletionCost = v0[j + 1] + 1;
+			int32_t insertionCost = v1[j] + 1;
+			int32_t substitutionCost;
+			if (str_char_to_lower(a->s[i]) == str_char_to_lower(b->s[j])) {
+				substitutionCost = v0[j];
+			} else {
+				substitutionCost = v0[j] + 1;
+			}
+
+			v1[j + 1] = min3(deletionCost, insertionCost, substitutionCost);
+		}
+
+		if (v0 == _v0) {
+			v0 = _v1;
+			v1 = _v0;
+		} else {
+			v0 = _v0;
+			v1 = _v1;
+		}
+	}
+
+	return v0[n - 1];
+}
+
+#define JARO_WINKLER_MAX_COMPARE_LEN 64
+
+static double
+str_jaro_winkler_distance(const struct str *s1, const struct str *s2)
+{
+	if (s1->len > s2->len) {
+		const struct str *s3 = s1;
+		s1 = s2;
+		s2 = s3;
+	}
+	int32_t length1 = s1->len, length2 = s2->len;
+
+	if (length1 > JARO_WINKLER_MAX_COMPARE_LEN) {
+		length1 = JARO_WINKLER_MAX_COMPARE_LEN;
+	}
+	if (length2 > JARO_WINKLER_MAX_COMPARE_LEN) {
+		length2 = JARO_WINKLER_MAX_COMPARE_LEN;
+	}
+
+	double m = 0, t = 0;
+	int32_t range = length1 > 3 ? length2 / 2 - 1 : 0;
+	uint64_t flags1 = 0, flags2 = 0;
+
+	for (int32_t i = 0; i < length1; ++i) {
+		int32_t last = i + range;
+		for (int32_t j = i >= range ? i - range : 0; j < last; ++j) {
+			if (!(flags2 & (1 << j)) && str_char_to_lower(s1->s[i]) == str_char_to_lower(s2->s[j])) {
+				flags1 |= 1 << i;
+				flags2 |= 1 << j;
+				m += 1;
+				break;
+			}
+		}
+	}
+
+	if (m == 0.0) {
+		return m;
+	}
+
+	int32_t k = 0;
+	for (int32_t i = 0; i < length1; ++i) {
+		if ((flags1 & (1 << i))) {
+			int32_t index = k;
+			for (int32_t j = k; j < length2; ++j) {
+				index = j;
+
+				if ((flags2 & (1 << j))) {
+					k = j + 1;
+					break;
+				}
+			}
+
+			if (str_char_to_lower(s1->s[i]) != str_char_to_lower(s2->s[index])) {
+				t += 0.5;
+			}
+		}
+	}
+
+	double dist = m == 0 ? 0 : (m / length1 + m / length2 + (m - t) / m) / 3;
+
+	if (dist > 0.7) {
+		double prefix_bonus = 0.0;
+
+		for (int32_t i = 0; i < length1 && i < 4; ++i) {
+			if (str_char_to_lower(s1->s[i]) == str_char_to_lower(s2->s[i])) {
+				prefix_bonus += 0.25;
+			} else {
+				break;
+			}
+		}
+
+		dist += prefix_bonus * (1 - dist);
+	}
+
+	return dist;
+}
+
+bool
+str_fuzzy_match(const struct str *input, const struct str *guess, int32_t *dist)
+{
+	{
+		double threshold = input->len > 3 ? 0.834 : 0.77;
+		if (str_jaro_winkler_distance(input, guess) < threshold) {
+			return false;
+		}
+	}
+
+	{
+		int32_t threshold = (input->len * 0.25) + 0.5;
+		if ((*dist = str_levenshtein_distance(input, guess)) > threshold) {
+			return false;
+		}
+	}
+
+	return true;
 }

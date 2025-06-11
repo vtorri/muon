@@ -116,7 +116,9 @@ subprojects_gather_iter(struct workspace *wk, struct subprojects_common_ctx *ctx
 struct subprojects_process_opts {
 	uint32_t job_count;
 	enum wrap_handle_mode wrap_mode;
+	const char *subprojects_dir;
 	obj *res;
+	bool single_file;
 	bool progress_bar;
 };
 
@@ -253,16 +255,44 @@ subprojects_process_progress_decorate(void *_ctx, uint32_t width)
 	decorate_ctx->prev_list_len = list_len;
 }
 
+static obj
+wrap_to_obj(struct workspace *wk, struct wrap *wrap)
+{
+	char *t = "file";
+	if (wrap->type == wrap_type_git) {
+		t = "git ";
+	}
+
+	obj d = make_obj(wk, obj_dict);
+	obj_dict_set(wk, d, make_str(wk, "name"), make_str(wk, wrap->name.buf));
+	obj_dict_set(wk, d, make_str(wk, "type"), make_str(wk, t));
+	obj_dict_set(wk, d, make_str(wk, "path"), tstr_into_str(wk, &wrap->dest_dir));
+	return d;
+}
+
 static bool
 subprojects_process(struct workspace *wk, obj list, struct subprojects_process_opts *opts)
 {
 	// Init ctx
-	struct subprojects_common_ctx ctx = { .res = opts->res };
+	struct subprojects_common_ctx ctx = {
+		.res = opts->res
+	};
 	arr_init(&ctx.handlers, 8, sizeof(struct wrap_handle_ctx));
 	*ctx.res = make_obj(wk, obj_array);
 
 	// Gather subprojects
-	subprojects_foreach(wk, list, &ctx, subprojects_gather_iter);
+	if (opts->single_file) {
+		struct wrap_handle_ctx wrap_ctx = {
+			.path = get_str(wk, list)->s,
+			.opts = {
+				.allow_download = true,
+				.subprojects = opts->subprojects_dir,
+			},
+		};
+		arr_push(&ctx.handlers, &wrap_ctx);
+	} else {
+		subprojects_foreach(wk, list, &ctx, subprojects_gather_iter);
+	}
 
 	// Progress bar setup
 	log_progress_push_state(wk);
@@ -275,6 +305,7 @@ subprojects_process(struct workspace *wk, obj list, struct subprojects_process_o
 		.show_count = true,
 		.decorate = subprojects_process_progress_decorate,
 		.usr_ctx = &decorate_ctx,
+		.dont_disable_on_error = true,
 	};
 	log_progress_set_style(&log_progress_style);
 
@@ -292,6 +323,7 @@ subprojects_process(struct workspace *wk, obj list, struct subprojects_process_o
 	timer_start(&ctx.duration);
 
 	while (cnt_complete < ctx.handlers.len) {
+		float loop_start = timer_read(&ctx.duration);
 		cnt_running = 0;
 
 		for (i = 0; i < ctx.handlers.len; ++i) {
@@ -311,9 +343,10 @@ subprojects_process(struct workspace *wk, obj list, struct subprojects_process_o
 				continue;
 			}
 
+			wrap_ctx->ok = true;
 			++cnt_running;
 
-			if (cnt_running >= opts->job_count) {
+			if (cnt_running > opts->job_count) {
 				break;
 			}
 
@@ -321,7 +354,10 @@ subprojects_process(struct workspace *wk, obj list, struct subprojects_process_o
 
 			if (!wrap_handle_async(wk, wrap_ctx->path, wrap_ctx)) {
 				wrap_ctx->sub_state = wrap_handle_sub_state_collected;
-				LOG_I(CLR(c_red) "error" CLR(0) " %s", wrap_ctx->wrap.name.buf);
+				if (wrap_ctx->wrap.name.len) {
+					LOG_I(CLR(c_red) "failed" CLR(0) " %s", wrap_ctx->wrap.name.buf);
+				}
+				wrap_ctx->ok = false;
 				++cnt_failed;
 				++cnt_complete;
 			}
@@ -331,20 +367,20 @@ subprojects_process(struct workspace *wk, obj list, struct subprojects_process_o
 
 		log_progress_subval(wk, cnt_complete, cnt_complete + cnt_running);
 
-		timer_sleep(SLEEP_TIME);
+		float loop_dur_ns = (timer_read(&ctx.duration) - loop_start) * 1e9;
+		if (loop_dur_ns < ((double)SLEEP_TIME/10.0)) {
+			timer_sleep(((double)SLEEP_TIME/10.0) - loop_dur_ns);
+		}
 	}
 
 	for (i = 0; i < ctx.handlers.len; ++i) {
 		wrap_ctx = arr_get(&ctx.handlers, i);
 
-		char *t = "file";
-		if (wrap_ctx->wrap.type == wrap_type_git) {
-			t = "git ";
+		if (!wrap_ctx->ok) {
+			continue;
 		}
 
-		obj d = make_obj(wk, obj_dict);
-		obj_dict_set(wk, d, make_str(wk, "name"), make_str(wk, wrap_ctx->wrap.name.buf));
-		obj_dict_set(wk, d, make_str(wk, "type"), make_str(wk, t));
+		obj d = wrap_to_obj(wk, &wrap_ctx->wrap);
 
 		switch (opts->wrap_mode) {
 		case wrap_handle_mode_check_dirty: {
@@ -366,7 +402,6 @@ subprojects_process(struct workspace *wk, obj list, struct subprojects_process_o
 
 	if (opts->progress_bar) {
 		log_progress_disable();
-		log_raw("\033[0K");
 	}
 	log_progress_pop_state(wk);
 
@@ -471,7 +506,7 @@ static enum iteration_result
 subprojects_clean_iter(struct workspace *wk, struct subprojects_common_ctx *ctx, const char *path)
 {
 	struct wrap wrap = { 0 };
-	if (!wrap_parse(wk, path, &wrap)) {
+	if (!wrap_parse(wk, subprojects_dir(wk), path, &wrap)) {
 		goto cont;
 	}
 
@@ -530,6 +565,59 @@ func_subprojects_clean(struct workspace *wk, obj self, obj *res)
 	return subprojects_foreach(wk, an[0].val, &ctx, subprojects_clean_iter);
 }
 
+static bool
+func_subprojects_fetch(struct workspace *wk, obj self, obj *res)
+{
+	struct args_norm an[] = {
+		{ tc_string, .desc = "The wrap file to fetch." },
+		{ tc_string, .optional = true, .desc = "The directory to fetch into" },
+		ARG_TYPE_NULL,
+	};
+	enum kwargs {
+		kw_force,
+	};
+	struct args_kw akw[] = {
+		[kw_force] = { "force", tc_bool, .desc = "Force the operation." },
+		0,
+	};
+	if (!pop_args(wk, an, akw)) {
+		return false;
+	}
+
+	return subprojects_process(wk,
+		an[0].val,
+		&(struct subprojects_process_opts){
+			.wrap_mode = wrap_handle_mode_update,
+			.job_count = 1,
+			.progress_bar = true,
+			.subprojects_dir = an[1].set ? get_cstr(wk, an[1].val) : path_cwd(),
+			.single_file = true,
+			.res = res,
+		});
+}
+
+static bool
+func_subprojects_load_wrap(struct workspace *wk, obj self, obj *res)
+{
+	struct args_norm an[] = {
+		{ tc_string, .desc = "The wrap file to load." },
+		ARG_TYPE_NULL,
+	};
+	if (!pop_args(wk, an, 0)) {
+		return false;
+	}
+
+	struct wrap wrap = { 0 };
+	if (!wrap_parse(wk, ".", get_cstr(wk, an[0].val), &wrap)) {
+		return false;
+	}
+
+	*res = wrap_to_obj(wk, &wrap);
+
+	wrap_destroy(&wrap);
+	return true;
+}
+
 const struct func_impl impl_tbl_module_subprojects[] = {
 	{ "update", func_subprojects_update, .flags = func_impl_flag_sandbox_disable, .desc = "Update subprojects with .wrap files" },
 	{ "list",
@@ -537,6 +625,8 @@ const struct func_impl impl_tbl_module_subprojects[] = {
 		tc_array,
 		.flags = func_impl_flag_sandbox_disable,
 		.desc = "List subprojects with .wrap files and their status." },
-	{ "clean", func_subprojects_clean, .flags = func_impl_flag_sandbox_disable, .desc = "Clean wrap-git subprojects" },
+	{ "clean", func_subprojects_clean, .flags = func_impl_flag_sandbox_disable, .desc = "Clean subprojects with .wrap files" },
+	{ "fetch", func_subprojects_fetch, .flags = func_impl_flag_sandbox_disable, .desc = "Fetch a project using a .wrap file" },
+	{ "load_wrap", func_subprojects_load_wrap, .flags = func_impl_flag_sandbox_disable, .desc = "Load a wrap file into a dict" },
 	{ NULL, NULL },
 };

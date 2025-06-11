@@ -25,6 +25,8 @@
 #include "tracy.h"
 #include "wrap.h"
 
+static const char *meson_subproject_wrap_hash_txt = ".meson-subproject-wrap-hash.txt";
+
 static const char *wrap_field_names[wrap_fields_count] = {
 	[wf_directory] = "directory",
 	[wf_patch_url] = "patch_url",
@@ -33,6 +35,7 @@ static const char *wrap_field_names[wrap_fields_count] = {
 	[wf_patch_hash] = "patch_hash",
 	[wf_patch_directory] = "patch_directory",
 	[wf_diff_files] = "diff_files",
+	[wf_method] = "method",
 	[wf_source_url] = "source_url",
 	[wf_source_fallback_url] = "source_fallback_url",
 	[wf_source_filename] = "source_filename",
@@ -267,8 +270,8 @@ wrap_parse_provides_cb(void *_ctx,
 		error_messagef(src, location, log_error, "empty provides key \"%s\"", k);
 		return false;
 	} else if (!*v) {
-		error_messagef(src, location, log_error, "empty provides value \"%s\"", v);
-		return false;
+		error_messagef(src, location, log_warn, "empty provides value \"%s\"", v);
+		return true;
 	}
 
 	ctx->add_provides_tgt = 0;
@@ -323,26 +326,11 @@ wrap_checksum(struct workspace *wk,
 		memcpy(buf, &sha256[i], 2);
 		b = strtol(buf, NULL, 16);
 		if (b != hash[i / 2]) {
-			wrap_log(ctx, log_error, "checksum mismatch");
+			char buf[65];
+			sha256_to_str(hash, buf);
+			wrap_log(ctx, log_error, "checksum mismatch: '%s' != '%s'", sha256, buf);
 			return false;
 		}
-	}
-
-	return true;
-}
-
-static bool
-wrap_checksum_extract(struct workspace *wk,
-	struct wrap_handle_ctx *ctx,
-	const char *buf,
-	size_t len,
-	const char *sha256,
-	const char *dest_dir)
-{
-	if (sha256 && !wrap_checksum(wk, ctx, (const uint8_t *)buf, len, sha256)) {
-		return false;
-	} else if (!muon_archive_extract(buf, len, dest_dir)) {
-		return false;
 	}
 
 	return true;
@@ -370,6 +358,41 @@ wrap_copy_packagefiles_dir(struct workspace *wk, const char *src_base, const cha
 	return fs_copy_dir_ctx(&ctx);
 }
 
+enum wrap_checksum_extract_local_file_result {
+	wrap_checksum_extract_local_file_result_failed,
+	wrap_checksum_extract_local_file_result_checksum_mismatch,
+	wrap_checksum_extract_local_file_result_ok,
+};
+
+static enum wrap_checksum_extract_local_file_result
+wrap_checksum_extract_local_file(struct workspace *wk,
+	struct wrap_handle_ctx *ctx,
+	const char *source_path,
+	const char *hash,
+	const char *dest_dir,
+	bool ignore_if_hash_mismatch)
+{
+	struct source src = { 0 };
+	if (!fs_read_entire_file(source_path, &src)) {
+		return wrap_checksum_extract_local_file_result_failed;
+	}
+
+	if (hash) {
+		if (!wrap_checksum(wk, ctx, (const uint8_t *)src.src, src.len, hash)) {
+			fs_source_destroy(&src);
+
+			if (ignore_if_hash_mismatch) {
+				return wrap_checksum_extract_local_file_result_checksum_mismatch;
+			}
+			return wrap_checksum_extract_local_file_result_failed;
+		}
+	}
+
+	bool ok = muon_archive_extract(src.src, src.len, dest_dir);
+	fs_source_destroy(&src);
+	return ok ? wrap_checksum_extract_local_file_result_ok : wrap_checksum_extract_local_file_result_failed;
+}
+
 static bool
 wrap_download_or_check_packagefiles(struct workspace *wk,
 	const char *filename,
@@ -379,7 +402,6 @@ wrap_download_or_check_packagefiles(struct workspace *wk,
 	struct wrap_handle_ctx *ctx)
 {
 	TSTR(source_path);
-
 	path_join(wk, &source_path, ctx->opts.subprojects, "packagefiles");
 	path_push(wk, &source_path, filename);
 
@@ -392,17 +414,9 @@ wrap_download_or_check_packagefiles(struct workspace *wk,
 			wrap_log(ctx, log_warn, "url specified, but local file '%s' is being used", source_path.buf);
 		}
 
-		struct source src = { 0 };
-		if (!fs_read_entire_file(source_path.buf, &src)) {
+		if (!wrap_checksum_extract_local_file(wk, ctx, source_path.buf, hash, dest_dir, false)) {
 			return false;
 		}
-
-		if (!wrap_checksum_extract(wk, ctx, src.src, src.len, hash, dest_dir)) {
-			fs_source_destroy(&src);
-			return false;
-		}
-
-		fs_source_destroy(&src);
 	} else if (fs_dir_exists(source_path.buf)) {
 		if (url) {
 			wrap_log(ctx,
@@ -415,6 +429,23 @@ wrap_download_or_check_packagefiles(struct workspace *wk,
 			return false;
 		}
 	} else if (url) {
+		// If a hash is specified and has already been downloaded, just use that instead.
+		if (hash) {
+			path_join(wk, &source_path, ctx->opts.subprojects, "packagecache");
+			path_push(wk, &source_path, filename);
+
+			if (fs_file_exists(source_path.buf)) {
+				switch (wrap_checksum_extract_local_file(
+					wk, ctx, source_path.buf, hash, dest_dir, true)) {
+				case wrap_checksum_extract_local_file_result_failed: return false;
+				case wrap_checksum_extract_local_file_result_ok: return true;
+				case wrap_checksum_extract_local_file_result_checksum_mismatch:
+					L("ignoring cached file %s: checksum does not match", source_path.buf);
+					break;
+				}
+			}
+		}
+
 		if (!ctx->opts.allow_download) {
 			wrap_log(ctx, log_error, "wrap downloading is disabled");
 			return false;
@@ -428,6 +459,7 @@ wrap_download_or_check_packagefiles(struct workspace *wk,
 		ctx->fetch_ctx.handle = mc_fetch_begin(url, &ctx->fetch_ctx.buf, &ctx->fetch_ctx.len, flags);
 		ctx->fetch_ctx.hash = hash;
 		ctx->fetch_ctx.dest_dir = dest_dir;
+		ctx->fetch_ctx.filename = filename;
 
 		if (ctx->fetch_ctx.handle == -1) {
 			return false;
@@ -447,10 +479,13 @@ validate_wrap(struct wrap_parse_ctx *ctx, const char *file)
 	uint32_t i;
 
 	enum req { invalid, required, optional };
-	enum req field_req[wrap_fields_count] = { [wf_directory] = optional,
+	enum req field_req[wrap_fields_count] = {
+		[wf_directory] = optional,
 		[wf_patch_directory] = optional,
 		[wf_diff_files] = optional,
-		[wf_wrapdb_version] = optional };
+		[wf_wrapdb_version] = optional,
+		[wf_method] = optional,
+	};
 
 	if (ctx->wrap.fields[wf_patch_url] || ctx->wrap.fields[wf_patch_filename] || ctx->wrap.fields[wf_patch_hash]) {
 		field_req[wf_patch_url] = optional;
@@ -520,10 +555,9 @@ wrap_destroy(struct wrap *wrap)
 }
 
 bool
-wrap_parse(struct workspace *wk, const char *wrap_file, struct wrap *wrap)
+wrap_parse(struct workspace *wk, const char *subprojects, const char *wrap_file, struct wrap *wrap)
 {
 	bool res = false;
-	TSTR(subprojects);
 	struct wrap_parse_ctx ctx = { 0 };
 
 	if (!ini_parse(wrap_file, &ctx.wrap.src, &ctx.wrap.buf, wrap_parse_cb, &ctx)) {
@@ -539,7 +573,7 @@ wrap_parse(struct workspace *wk, const char *wrap_file, struct wrap *wrap)
 	tstr_init(&wrap->dest_dir, wrap->dest_dir_buf, ARRAY_LEN(wrap->dest_dir_buf), 0);
 	tstr_init(&wrap->name, wrap->name_buf, ARRAY_LEN(wrap->name_buf), 0);
 
-	path_basename(NULL, &wrap->name, wrap_file);
+	path_basename(wk, &wrap->name, wrap_file);
 
 	const struct str name = { .s = wrap->name.buf, .len = wrap->name.len }, ext = STR(".wrap");
 
@@ -554,8 +588,7 @@ wrap_parse(struct workspace *wk, const char *wrap_file, struct wrap *wrap)
 		dir = wrap->name.buf;
 	}
 
-	path_dirname(NULL, &subprojects, wrap_file);
-	path_join(NULL, &wrap->dest_dir, subprojects.buf, dir);
+	path_join(wk, &wrap->dest_dir, subprojects, dir);
 
 	res = true;
 ret:
@@ -746,6 +779,14 @@ wrap_apply_diff_files(struct workspace *wk, struct wrap_handle_ctx *ctx)
 static bool
 wrap_apply_patch(struct workspace *wk, struct wrap_handle_ctx *ctx)
 {
+	if ((ctx->wrap.fields[wf_diff_files] || ctx->wrap.fields[wf_patch_url]) && !ctx->wrap.updated) {
+		// Only apply patches with diff files or from urls after the wrap has
+		// been updated, not every time.
+		return true;
+	}
+
+	wrap_log(ctx, log_debug, "applying patch");
+
 	const char *dest_dir, *filename = NULL;
 	if (ctx->wrap.fields[wf_patch_directory]) {
 		dest_dir = ctx->wrap.dest_dir.buf;
@@ -787,7 +828,6 @@ wrap_handle_file(struct workspace *wk, struct wrap_handle_ctx *ctx)
 {
 	wrap_set_state(ctx, wrap_handle_state_apply_patch);
 	ctx->wrap.updated = true;
-	ctx->wrap.apply_patch = true;
 
 	const char *dest;
 	if (!ctx->wrap.fields[wf_source_filename]) {
@@ -810,6 +850,22 @@ wrap_handle_file(struct workspace *wk, struct wrap_handle_ctx *ctx)
 		ctx->wrap.fields[wf_source_hash],
 		dest,
 		ctx);
+}
+
+static bool
+wrap_hash(const char *wrap_file, char buf[65])
+{
+	struct source src;
+	if (!fs_read_entire_file(wrap_file, &src)) {
+		return false;
+	}
+
+	uint8_t hash[32];
+	calc_sha_256(hash, src.src, src.len);
+	sha256_to_str(hash, buf);
+	fs_source_destroy(&src);
+
+	return true;
 }
 
 static bool
@@ -854,8 +910,6 @@ wrap_handle_git(struct workspace *wk, struct wrap_handle_ctx *ctx)
 {
 	switch (ctx->state) {
 	case wrap_handle_state_git_init: {
-		ctx->wrap.apply_patch = true;
-
 		if (ctx->wrap.fields[wf_depth]) {
 			if (!str_to_i(&STRL(ctx->wrap.fields[wf_depth]), &ctx->git.depth, true)) {
 				wrap_log(ctx, log_error, "invalid value for depth: '%s'", ctx->wrap.fields[wf_depth]);
@@ -879,6 +933,14 @@ wrap_handle_git(struct workspace *wk, struct wrap_handle_ctx *ctx)
 	}
 	case wrap_handle_state_git_fetch: {
 		if (is_git_dir(wk, ctx->wrap.dest_dir.buf)) {
+			if (!wrap_run_cmd(wk,
+				    ctx,
+				    ARGV("git", "remote", "set-url", "origin", ctx->wrap.fields[wf_url]),
+				    ctx->wrap.dest_dir.buf,
+				    0)) {
+				return false;
+			}
+
 			if (ctx->git.depth) {
 				if (!git_fetch_revision(wk, ctx, ctx->git.depth_str)) {
 					return false;
@@ -1053,7 +1115,7 @@ wrap_handle_async(struct workspace *wk, const char *wrap_file, struct wrap_handl
 		}
 	} else if (ctx->sub_state == wrap_handle_sub_state_fetching) {
 		if (ctx->opts.block) {
-			mc_wait();
+			mc_wait(1000);
 		}
 
 		struct mc_fetch_stats fetch_stats = { 0 };
@@ -1070,16 +1132,34 @@ wrap_handle_async(struct workspace *wk, const char *wrap_file, struct wrap_handl
 			return false;
 		case mc_fetch_collect_result_done: {
 			ctx->sub_state = wrap_handle_sub_state_extracting;
+
+			if (ctx->fetch_ctx.hash) {
+				if (!wrap_checksum(wk,
+					    ctx,
+					    (const uint8_t *)ctx->fetch_ctx.buf,
+					    ctx->fetch_ctx.len,
+					    ctx->fetch_ctx.hash)) {
+					return false;
+				}
+
+				TSTR(cache_path);
+				path_join(wk, &cache_path, ctx->opts.subprojects, "packagecache");
+				if (!fs_mkdir_p(cache_path.buf)) {
+					return false;
+				}
+				path_push(wk, &cache_path, ctx->fetch_ctx.filename);
+
+				if (!fs_write(
+					    cache_path.buf, (const uint8_t *)ctx->fetch_ctx.buf, ctx->fetch_ctx.len)) {
+					return false;
+				}
+			}
 			return true;
 		}
 		}
 	} else if (ctx->sub_state == wrap_handle_sub_state_extracting) {
-		if (!wrap_checksum_extract(wk,
-			    ctx,
-			    (const char *)ctx->fetch_ctx.buf,
-			    ctx->fetch_ctx.len,
-			    ctx->fetch_ctx.hash,
-			    ctx->fetch_ctx.dest_dir)) {
+		if (!muon_archive_extract(
+			    (const char *)ctx->fetch_ctx.buf, ctx->fetch_ctx.len, ctx->fetch_ctx.dest_dir)) {
 			return false;
 		}
 		ctx->sub_state = wrap_handle_sub_state_running;
@@ -1090,7 +1170,7 @@ wrap_handle_async(struct workspace *wk, const char *wrap_file, struct wrap_handl
 		ctx->sub_state = wrap_handle_sub_state_running;
 		timer_start(&ctx->duration);
 
-		if (!wrap_parse(wk, wrap_file, &ctx->wrap)) {
+		if (!wrap_parse(wk, ctx->opts.subprojects, wrap_file, &ctx->wrap)) {
 			return false;
 		}
 
@@ -1109,10 +1189,31 @@ wrap_handle_async(struct workspace *wk, const char *wrap_file, struct wrap_handl
 		}
 
 		switch (ctx->wrap.type) {
-		case wrap_type_file:
-			// We currently have no way of checking if this wrap type is dirty
+		case wrap_type_file: {
+			if (ctx->wrap.fields[wf_source_url]) {
+				ctx->wrap.outdated = true;
+
+				TSTR(hash_path);
+				path_join(wk, &hash_path, ctx->wrap.dest_dir.buf, meson_subproject_wrap_hash_txt);
+
+				if (fs_file_exists(hash_path.buf)) {
+					char buf[65] = { 0 };
+					if (!wrap_hash(wrap_file, buf)) {
+						return false;
+					}
+
+					struct source src;
+					if (fs_read_entire_file(hash_path.buf, &src)) {
+						if (src.len >= 64 && memcmp(buf, src.src, 64) == 0) {
+							ctx->wrap.outdated = false;
+						}
+					}
+				}
+			}
+
 			wrap_handle_check_dirty_next_state(wk, ctx);
 			return true;
+		}
 		case wrap_type_git: {
 			if (!is_git_dir(wk, ctx->wrap.dest_dir.buf)) {
 				wrap_handle_check_dirty_next_state(wk, ctx);
@@ -1202,11 +1303,28 @@ wrap_handle_async(struct workspace *wk, const char *wrap_file, struct wrap_handl
 		return wrap_handle_git(wk, ctx);
 	}
 	case wrap_handle_state_apply_patch: {
-		if (ctx->wrap.apply_patch || ctx->wrap.fields[wf_patch_directory]) {
+		if (ctx->wrap.fields[wf_patch_directory] || ctx->wrap.fields[wf_patch_filename]) {
 			if (!wrap_apply_patch(wk, ctx)) {
 				return false;
 			}
 		}
+
+		if (ctx->wrap.updated && ctx->wrap.type == wrap_type_file) {
+			char buf[66] = { 0 };
+			if (!wrap_hash(wrap_file, buf)) {
+				return false;
+			}
+
+			buf[65] = '\n';
+
+			TSTR(hash_path);
+			path_join(wk, &hash_path, ctx->wrap.dest_dir.buf, meson_subproject_wrap_hash_txt);
+
+			if (!fs_write(hash_path.buf, (uint8_t *)buf, 64)) {
+				return false;
+			}
+		}
+
 		wrap_set_state(ctx, wrap_handle_state_done);
 		return true;
 	}
@@ -1261,7 +1379,7 @@ wrap_load_all_iter(void *_ctx, const char *file)
 	}
 
 	struct wrap wrap = { 0 };
-	if (!wrap_parse(ctx->wk, ctx->path->buf, &wrap)) {
+	if (!wrap_parse(ctx->wk, ctx->subprojects, ctx->path->buf, &wrap)) {
 		return ir_err;
 	}
 

@@ -207,6 +207,10 @@ func_lookup(struct workspace *wk, obj self, const char *name, uint32_t *idx, obj
 			if (!obj_dict_index_str(wk, m->exports, name, func)) {
 				return false;
 			}
+
+			if (!typecheck(wk, 0, *func, tc_capture)) {
+				return false;
+			}
 			return true;
 		}
 
@@ -936,7 +940,9 @@ dump_function_docs_json(struct workspace *wk, struct tstr *sb)
 		}
 	}
 
-	obj_to_json(wk, doc, sb);
+	if (!obj_to_json(wk, doc, sb)) {
+		UNREACHABLE;
+	}
 }
 
 void

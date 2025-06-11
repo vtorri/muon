@@ -80,10 +80,11 @@ enum token_type {
 	token_type_return,
 	token_type_returntype,
 	token_type_doc_comment,
+	token_type_null,
 };
 
 // Keep in sync with above
-#define token_type_count (token_type_doc_comment + 1)
+#define token_type_count (token_type_null + 1)
 
 enum cm_token_subtype {
 	cm_token_subtype_none,
@@ -142,6 +143,9 @@ struct lexer {
 
 bool is_valid_inside_of_identifier(const char c);
 bool is_valid_start_of_identifier(const char c);
+bool is_hex_digit(const char c);
+
+bool lex_string_escape_utf8(struct workspace *wk, struct tstr *buf, uint32_t val);
 
 void lexer_init(struct lexer *lexer, struct workspace *wk, const struct source *src, enum lexer_mode mode);
 void lexer_destroy(struct lexer *lexer);
