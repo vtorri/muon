@@ -1,0 +1,31 @@
+
+name: Test
+
+on: [push]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: A job to run test in OpenIndiana
+    env:
+      MYTOKEN : ${{ secrets.MYTOKEN }}
+      MYTOKEN2: "value2"
+    steps:
+    - uses: actions/checkout@v4
+    - name: Test in OpenIndiana
+      id: test
+      uses: vmactions/openindiana-vm@v0
+      with:
+        envs: 'MYTOKEN MYTOKEN2'
+        usesh: true
+        prepare: |
+          pkg install curl libarchive pkgconf
+
+        run: |
+          bootstrap.sh build
+          ./build/muon-bootstrap.exe setup build
+          ./build/muon-bootstrap.exe setup build
+          
+
+
+
